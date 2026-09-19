@@ -354,44 +354,6 @@ EOF
 # Preserve enough memory for PVE services on lower-memory Raspberry Pi variants.
 options zfs zfs_arc_max=1073741824
 EOF
-    cat > "$rootfs/usr/local/sbin/pve-rpi-expand-rootfs" <<'EOF'
-#!/bin/sh
-set -eu
-
-marker=/var/lib/pve-rpi-image/rootfs-expanded
-root_device=$(findmnt -n -o SOURCE /)
-
-[ -b "$root_device" ] || exit 0
-[ "$(findmnt -n -o FSTYPE /)" = ext4 ] || exit 0
-
-disk=/dev/$(lsblk -n -o PKNAME "$root_device")
-partition=$(lsblk -n -o PARTN "$root_device")
-[ -b "$disk" ] && [ -n "$partition" ] || exit 0
-
-# The image always uses a direct ext4 root partition. Grow it to the target
-# device boundary before extending the mounted filesystem.
-yes | parted ---pretend-input-tty "$disk" resizepart "$partition" 100%
-partprobe "$disk"
-resize2fs "$root_device"
-mkdir -p "$(dirname "$marker")"
-touch "$marker"
-EOF
-    chmod 0755 "$rootfs/usr/local/sbin/pve-rpi-expand-rootfs"
-    cat > "$rootfs/etc/systemd/system/pve-rpi-expand-rootfs.service" <<'EOF'
-[Unit]
-Description=Expand the Raspberry Pi PVE root filesystem once
-After=local-fs.target
-ConditionPathExists=!/var/lib/pve-rpi-image/rootfs-expanded
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/pve-rpi-expand-rootfs
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    mkdir -p "$rootfs/etc/systemd/system/multi-user.target.wants"
-    ln -sf ../pve-rpi-expand-rootfs.service "$rootfs/etc/systemd/system/multi-user.target.wants/pve-rpi-expand-rootfs.service"
     write_target_dns
     chroot_exec postconf -e "myhostname = $fqdn"
     chroot_exec postconf -e 'inet_interfaces = loopback-only'

@@ -187,6 +187,3 @@ jobs:
           grep -qFx "    dns-nameservers $PVE_DNS_SERVER" "$root/etc/network/interfaces"
           test -s "$root/etc/modprobe.d/zfs.conf"
           sudo chroot "$root" dpkg-query -W pve-edk2-firmware pve-edk2-firmware-aarch64 pve-firmware
-          test -x "$root/usr/local/sbin/pve-rpi-expand-rootfs"
-          test -L "$root/etc/systemd/system/multi-user.target.wants/pve-rpi-expand-rootfs.service"
-          test ! -e "$root/var/lib/pve-rpi-image/rootfs-expanded"
