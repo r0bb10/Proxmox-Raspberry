@@ -3,6 +3,14 @@ name: Build PVE Image
 on:
   workflow_dispatch:
     inputs:
+      platform:
+        description: Target Raspberry Pi platform
+        required: true
+        default: pi4
+        type: choice
+        options:
+          - pi4
+          - pi5
       root_password:
         description: Root account password
         required: true
@@ -35,7 +43,7 @@ on:
         type: string
 
 concurrency:
-  group: pve-rpi4-image
+  group: pve-${{ inputs.platform }}-image
   cancel-in-progress: false
 
 jobs:
@@ -46,6 +54,7 @@ jobs:
       contents: read
     env:
       PVE_ROOT_PASSWORD: ${{ inputs.root_password }}
+      PVE_PLATFORM: ${{ inputs.platform }}
       PVE_HOSTNAME: ${{ inputs.hostname }}
       PVE_DOMAIN: ${{ inputs.domain }}
       PVE_IPV4_CIDR: ${{ inputs.ipv4_cidr }}
@@ -62,10 +71,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y debootstrap dosfstools e2fsprogs parted rsync gnupg
 
-      - name: Build Raspberry Pi 4 image
+      - name: Build Raspberry Pi image
         run: |
-          sudo --preserve-env=PVE_ROOT_PASSWORD,PVE_HOSTNAME,PVE_DOMAIN,PVE_IPV4_CIDR,PVE_GATEWAY,PVE_DNS_SERVER bash tools/build-pve-image.sh \
-            --output dist/proxmox-ve-rpi4.img \
+          sudo --preserve-env=PVE_ROOT_PASSWORD,PVE_PLATFORM,PVE_HOSTNAME,PVE_DOMAIN,PVE_IPV4_CIDR,PVE_GATEWAY,PVE_DNS_SERVER bash tools/build-pve-image.sh \
+            --platform "$PVE_PLATFORM" \
+            --output "dist/proxmox-ve-$PVE_PLATFORM.img" \
             --reset
 
       - name: Record installed PVE version
@@ -73,20 +83,21 @@ jobs:
         run: |
           set -euo pipefail
           version="$(
-            sudo chroot "$GITHUB_WORKSPACE/.dev/rpi4-image-build/rootfs" \
+            sudo chroot "$GITHUB_WORKSPACE/.dev/$PVE_PLATFORM-image-build/rootfs" \
               dpkg-query -W -f='${Version}' pve-manager
           )"
           [ -n "$version" ]
-          image_name="proxmox-ve-rpi4-$version"
+          image_name="proxmox-ve-$PVE_PLATFORM-$version"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'image_name=%s\n' "$image_name" >> "$GITHUB_OUTPUT"
           printf 'IMAGE_NAME=%s\n' "$image_name" >> "$GITHUB_ENV"
-          sudo mv dist/proxmox-ve-rpi4.img "dist/$image_name.img"
+          sudo mv "dist/proxmox-ve-$PVE_PLATFORM.img" "dist/$image_name.img"
 
       - name: Upload image artifact
         uses: actions/upload-artifact@v7
         with:
-          name: proxmox-ve-rpi4-${{ steps.pve.outputs.version }}
-          path: dist/proxmox-ve-rpi4-${{ steps.pve.outputs.version }}.img
+          name: ${{ steps.pve.outputs.image_name }}
+          path: dist/${{ steps.pve.outputs.image_name }}.img
           retention-days: 14
           compression-level: 6
 
@@ -97,6 +108,7 @@ jobs:
       contents: read
     env:
       PVE_HOSTNAME: ${{ inputs.hostname }}
+      PVE_PLATFORM: ${{ inputs.platform }}
       PVE_DOMAIN: ${{ inputs.domain }}
       PVE_IPV4_CIDR: ${{ inputs.ipv4_cidr }}
       PVE_GATEWAY: ${{ inputs.gateway }}
@@ -105,7 +117,7 @@ jobs:
       - name: Download image artifact
         uses: actions/download-artifact@v8
         with:
-          name: proxmox-ve-rpi4-${{ needs.build.outputs.pve_version }}
+          name: proxmox-ve-${{ inputs.platform }}-${{ needs.build.outputs.pve_version }}
           path: image
 
       - name: Validate Raspberry Pi boot payload and root filesystem
@@ -113,7 +125,20 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq parted
-          image="image/proxmox-ve-rpi4-${{ needs.build.outputs.pve_version }}.img"
+          case "$PVE_PLATFORM" in
+            pi4)
+              boot_kernel=kernel8.img
+              boot_initramfs=initramfs8
+              boot_dtb=bcm2711-rpi-4-b.dtb
+              ;;
+            pi5)
+              boot_kernel=kernel_2712.img
+              boot_initramfs=initramfs_2712
+              boot_dtb=bcm2712-rpi-5-b.dtb
+              ;;
+            *) echo "FATAL: unsupported platform: $PVE_PLATFORM" >&2; exit 1 ;;
+          esac
+          image="image/proxmox-ve-$PVE_PLATFORM-${{ needs.build.outputs.pve_version }}.img"
           boot="$(mktemp -d)"
           root="$(mktemp -d)"
           loop=""
@@ -140,13 +165,14 @@ jobs:
           root_uuid="$(sudo blkid -s UUID -o value "${loop}p2")"
           test -s "$boot/start4.elf"
           test -s "$boot/fixup4.dat"
-          test -s "$boot/kernel8.img"
-          test -s "$boot/initramfs8"
-          test -s "$boot/bcm2711-rpi-4-b.dtb"
+          test -s "$boot/$boot_kernel"
+          test -s "$boot/$boot_initramfs"
+          test -s "$boot/$boot_dtb"
           test -d "$boot/overlays"
           grep -qFx 'arm_64bit=1' "$boot/config.txt"
           grep -qFx 'enable_uart=1' "$boot/config.txt"
           grep -qFx 'auto_initramfs=1' "$boot/config.txt"
+          grep -qFx "kernel=$boot_kernel" "$boot/config.txt"
           test "$(wc -l < "$boot/cmdline.txt")" -eq 1
           grep -qF "root=UUID=$root_uuid " "$boot/cmdline.txt"
           grep -qF 'console=serial0,115200' "$boot/cmdline.txt"

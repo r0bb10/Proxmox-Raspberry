@@ -2,13 +2,14 @@
 set -euo pipefail
 
 root=$(realpath "$(dirname "$0")/..")
-output="$root/dist/proxmox-ve-rpi4.img"
+platform=${PVE_PLATFORM:-pi4}
+output=""
 stage=all
 reset=0
 
 usage() {
     cat <<EOF
-usage: $0 [--output PATH] [--stage STAGE] [--reset]
+usage: $0 [--platform pi4|pi5] [--output PATH] [--stage STAGE] [--reset]
 
 Stages: bootstrap, proxmox, configure, assemble, all, clean
 EOF
@@ -16,6 +17,7 @@ EOF
 
 while (($#)); do
     case "$1" in
+        --platform) platform=${2:?missing value for --platform}; shift 2 ;;
         --output) output=${2:?missing value for --output}; shift 2 ;;
         --stage) stage=${2:?missing value for --stage}; shift 2 ;;
         --reset) reset=1; shift ;;
@@ -25,12 +27,32 @@ while (($#)); do
 done
 
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
+case "$platform" in
+    pi4)
+        kernel_image_package=linux-image-rpi-v8
+        kernel_headers_package=linux-headers-rpi-v8
+        kernel_modules_suffix=-rpi-v8
+        boot_kernel=kernel8.img
+        boot_initramfs=initramfs8
+        boot_dtb=bcm2711-rpi-4-b.dtb
+        ;;
+    pi5)
+        kernel_image_package=linux-image-rpi-2712
+        kernel_headers_package=linux-headers-rpi-2712
+        kernel_modules_suffix=-rpi-2712
+        boot_kernel=kernel_2712.img
+        boot_initramfs=initramfs_2712
+        boot_dtb=bcm2712-rpi-5-b.dtb
+        ;;
+    *) die "platform must be pi4 or pi5" ;;
+esac
+[[ -n $output ]] || output="$root/dist/proxmox-ve-$platform.img"
 [[ $(id -u) -eq 0 ]] || die "run as root"
 for command in curl debootstrap du gpg losetup mkfs.ext4 mkfs.vfat mount parted partprobe rsync umount; do
     command -v "$command" >/dev/null || die "missing command: $command"
 done
 
-work=${WORKDIR:-"$root/.dev/rpi4-image-build"}
+work=${WORKDIR:-"$root/.dev/$platform-image-build"}
 rootfs="$work/rootfs"
 state="$work/.state"
 root_min_gib=${IMG_ROOT_GIB:-0}
@@ -146,9 +168,9 @@ nameserver $dns_server
 EOF
 }
 kernel_release() {
-    local -a modules=("$rootfs"/lib/modules/*-rpi-v8)
-    [[ -d ${modules[0]} ]] || die "Raspberry Pi 4 kernel modules missing"
-    ((${#modules[@]} == 1)) || die "expected one Raspberry Pi 4 kernel release"
+    local -a modules=("$rootfs"/lib/modules/*"$kernel_modules_suffix")
+    [[ -d ${modules[0]} ]] || die "Raspberry Pi $platform kernel modules missing"
+    ((${#modules[@]} == 1)) || die "expected one Raspberry Pi $platform kernel release"
     basename "${modules[0]}"
 }
 clean() {
@@ -205,7 +227,7 @@ Signed-By: /etc/apt/keyrings/raspberrypi-archive-keyring.gpg
 EOF
     chroot_exec apt-get update -qq
     chroot_exec apt-get install -y -qq \
-        linux-image-rpi-v8 linux-headers-rpi-v8 raspi-firmware \
+        "$kernel_image_package" "$kernel_headers_package" raspi-firmware \
         build-essential dkms zfs-dkms zfsutils-linux \
         raspi-utils-core raspi-utils-dt rpi-eeprom raspinfo \
         locales kmod initramfs-tools openssh-server chrony cron postfix \
@@ -250,10 +272,10 @@ configure() {
     local release
     release=$(kernel_release)
     boot="$rootfs/boot/firmware"
-    [[ -s "$boot/kernel8.img" ]] || die "Raspberry Pi 64-bit kernel missing"
-    [[ -s "$boot/initramfs8" ]] || die "Raspberry Pi initramfs missing"
+    [[ -s "$boot/$boot_kernel" ]] || die "Raspberry Pi $platform kernel missing"
+    [[ -s "$boot/$boot_initramfs" ]] || die "Raspberry Pi $platform initramfs missing"
     [[ -s "$boot/start4.elf" ]] || die "Raspberry Pi firmware missing"
-    [[ -s "$boot/bcm2711-rpi-4-b.dtb" ]] || die "Raspberry Pi 4 DTB missing"
+    [[ -s "$boot/$boot_dtb" ]] || die "Raspberry Pi $platform DTB missing"
     [[ -d "$boot/overlays" ]] || die "Raspberry Pi overlays missing"
     [[ -s "$state/root-uuid" ]] || cat /proc/sys/kernel/random/uuid > "$state/root-uuid"
     root_uuid=$(<"$state/root-uuid")
@@ -317,10 +339,10 @@ dtoverlay=dwc2,dr_mode=host
 dtoverlay=nospi10
 
 [all]
-# PVE image settings: expose the serial console and select the Pi 4 kernel.
+# PVE image settings: expose the serial console and select the target kernel.
 enable_uart=1
-kernel=kernel8.img
 EOF
+    printf 'kernel=%s\n' "$boot_kernel" >> "$boot/config.txt"
     cat > "$boot/cmdline.txt" <<EOF
 console=serial0,115200 console=tty1 root=UUID=$root_uuid rootfstype=ext4 rootwait fsck.repair=yes net.ifnames=0 cgroup_enable=cpuset cgroup_enable=memory cgroup_memory=1 swapaccount=1
 EOF
@@ -329,7 +351,7 @@ EOF
     printf 'PermitRootLogin yes\n' > "$rootfs/etc/ssh/sshd_config.d/99-root.conf"
     ln -sf /lib/systemd/system/serial-getty@.service "$rootfs/etc/systemd/system/getty.target.wants/serial-getty@serial0.service"
     cat > "$rootfs/etc/modprobe.d/zfs.conf" <<'EOF'
-# Preserve enough memory for PVE services on every Raspberry Pi 4 RAM variant.
+# Preserve enough memory for PVE services on lower-memory Raspberry Pi variants.
 options zfs zfs_arc_max=1073741824
 EOF
     cat > "$rootfs/usr/local/sbin/pve-rpi-expand-rootfs" <<'EOF'
@@ -393,7 +415,7 @@ assemble() {
     complete configure || die "run configure first"
     root_uuid=$(<"$state/root-uuid")
     boot="$rootfs/boot/firmware"
-    [[ -s "$boot/kernel8.img" && -s "$boot/initramfs8" && -s "$boot/config.txt" && -s "$boot/cmdline.txt" ]] || die "Raspberry Pi boot payload incomplete"
+    [[ -s "$boot/$boot_kernel" && -s "$boot/$boot_initramfs" && -s "$boot/config.txt" && -s "$boot/cmdline.txt" ]] || die "Raspberry Pi boot payload incomplete"
     image="$work/image.img"
     rm -f "$image" "$output"
     root_bytes=$(du -sx --apparent-size --block-size=1 "$rootfs" | cut -f1)
