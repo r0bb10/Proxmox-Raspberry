@@ -1,0 +1,166 @@
+name: Build PVE Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      root_password:
+        description: Root account password
+        required: true
+        default: root
+        type: string
+      hostname:
+        description: Proxmox hostname
+        required: true
+        default: pve
+        type: string
+      domain:
+        description: DNS domain
+        required: true
+        default: localdomain
+        type: string
+      ipv4_cidr:
+        description: Static vmbr0 IPv4 address and prefix length
+        required: true
+        default: 192.168.1.2/24
+        type: string
+      gateway:
+        description: Static vmbr0 IPv4 gateway
+        required: true
+        default: 192.168.1.1
+        type: string
+      dns_server:
+        description: DNS server for the installed image
+        required: true
+        default: 192.168.1.1
+        type: string
+
+concurrency:
+  group: pve-rpi4-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      PVE_ROOT_PASSWORD: ${{ inputs.root_password }}
+      PVE_HOSTNAME: ${{ inputs.hostname }}
+      PVE_DOMAIN: ${{ inputs.domain }}
+      PVE_IPV4_CIDR: ${{ inputs.ipv4_cidr }}
+      PVE_GATEWAY: ${{ inputs.gateway }}
+      PVE_DNS_SERVER: ${{ inputs.dns_server }}
+    outputs:
+      pve_version: ${{ steps.pve.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install image build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debootstrap dosfstools e2fsprogs parted rsync gnupg
+
+      - name: Build Raspberry Pi 4 image
+        run: |
+          sudo --preserve-env=PVE_ROOT_PASSWORD,PVE_HOSTNAME,PVE_DOMAIN,PVE_IPV4_CIDR,PVE_GATEWAY,PVE_DNS_SERVER bash tools/build-pve-image.sh \
+            --output dist/proxmox-ve-rpi4.img \
+            --reset
+
+      - name: Record installed PVE version
+        id: pve
+        run: |
+          set -euo pipefail
+          version="$(
+            sudo chroot "$GITHUB_WORKSPACE/.dev/rpi4-image-build/rootfs" \
+              dpkg-query -W -f='${Version}' pve-manager
+          )"
+          [ -n "$version" ]
+          image_name="proxmox-ve-rpi4-$version"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'IMAGE_NAME=%s\n' "$image_name" >> "$GITHUB_ENV"
+          sudo mv dist/proxmox-ve-rpi4.img "dist/$image_name.img"
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: proxmox-ve-rpi4-${{ steps.pve.outputs.version }}
+          path: dist/proxmox-ve-rpi4-${{ steps.pve.outputs.version }}.img
+          retention-days: 14
+          compression-level: 6
+
+  validate:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    env:
+      PVE_HOSTNAME: ${{ inputs.hostname }}
+      PVE_DOMAIN: ${{ inputs.domain }}
+      PVE_IPV4_CIDR: ${{ inputs.ipv4_cidr }}
+      PVE_GATEWAY: ${{ inputs.gateway }}
+      PVE_DNS_SERVER: ${{ inputs.dns_server }}
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: proxmox-ve-rpi4-${{ needs.build.outputs.pve_version }}
+          path: image
+
+      - name: Validate Raspberry Pi boot payload and root filesystem
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq parted
+          image="image/proxmox-ve-rpi4-${{ needs.build.outputs.pve_version }}.img"
+          boot="$(mktemp -d)"
+          root="$(mktemp -d)"
+          loop=""
+          cleanup() {
+            sudo umount "$boot" "$root" 2>/dev/null || true
+            [ -z "$loop" ] || sudo losetup -d "$loop" 2>/dev/null || true
+            rm -rf "$boot" "$root"
+          }
+          trap cleanup EXIT
+          (( $(stat --format=%s "$image") % 512 == 0 ))
+          loop="$(sudo losetup -Pf --show "$image")"
+          for _ in {1..10}; do
+            [ -b "${loop}p1" ] && [ -b "${loop}p2" ] && break
+            sudo partprobe "$loop"
+            sleep 1
+          done
+          [ -b "${loop}p1" ] && [ -b "${loop}p2" ]
+          sudo mount "${loop}p1" "$boot"
+          sudo mount "${loop}p2" "$root"
+          test "$(sudo blkid -s TYPE -o value "${loop}p1")" = vfat
+          test "$(sudo blkid -s LABEL -o value "${loop}p1")" = BOOT
+          test "$(sudo blkid -s TYPE -o value "${loop}p2")" = ext4
+          test "$(sudo blkid -s LABEL -o value "${loop}p2")" = rootfs
+          root_uuid="$(sudo blkid -s UUID -o value "${loop}p2")"
+          test -s "$boot/start4.elf"
+          test -s "$boot/fixup4.dat"
+          test -s "$boot/kernel8.img"
+          test -s "$boot/initramfs8"
+          test -s "$boot/bcm2711-rpi-4-b.dtb"
+          test -d "$boot/overlays"
+          grep -qFx 'arm_64bit=1' "$boot/config.txt"
+          grep -qFx 'enable_uart=1' "$boot/config.txt"
+          grep -qFx 'auto_initramfs=1' "$boot/config.txt"
+          test "$(wc -l < "$boot/cmdline.txt")" -eq 1
+          grep -qF "root=UUID=$root_uuid " "$boot/cmdline.txt"
+          grep -qF 'console=serial0,115200' "$boot/cmdline.txt"
+          grep -qFx "UUID=$root_uuid / ext4 defaults,noatime 0 1" "$root/etc/fstab"
+          grep -qFx 'LABEL=BOOT /boot/firmware vfat defaults 0 2' "$root/etc/fstab"
+          fqdn="$PVE_HOSTNAME.$PVE_DOMAIN"
+          sudo grep -qFx "$PVE_HOSTNAME" "$root/etc/hostname"
+          grep -qFx "${PVE_IPV4_CIDR%/*} $fqdn $PVE_HOSTNAME" "$root/etc/hosts"
+          grep -qFx 'iface vmbr0 inet static' "$root/etc/network/interfaces"
+          grep -qFx "    address $PVE_IPV4_CIDR" "$root/etc/network/interfaces"
+          grep -qFx "    gateway $PVE_GATEWAY" "$root/etc/network/interfaces"
+          grep -qFx "    dns-nameservers $PVE_DNS_SERVER" "$root/etc/network/interfaces"
+          test -s "$root/etc/modprobe.d/zfs.conf"
+          sudo chroot "$root" dpkg-query -W pve-edk2-firmware pve-edk2-firmware-aarch64 pve-firmware
+          test -x "$root/usr/local/sbin/pve-rpi-expand-rootfs"
+          test -L "$root/etc/systemd/system/multi-user.target.wants/pve-rpi-expand-rootfs.service"
+          test ! -e "$root/var/lib/pve-rpi-image/rootfs-expanded"
