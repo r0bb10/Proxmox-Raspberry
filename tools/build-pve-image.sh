@@ -54,7 +54,7 @@ case "$rootfs_type" in
 esac
 [[ -n $output ]] || output="$root/dist/proxmox-ve-$platform-$rootfs_type.img"
 [[ $(id -u) -eq 0 ]] || die "run as root"
-for command in curl debootstrap du gpg losetup mkfs.vfat mount parted partprobe rsync umount; do
+for command in curl debootstrap du gpg losetup mkfs.vfat mount parted partprobe rsync sha256sum umount; do
     command -v "$command" >/dev/null || die "missing command: $command"
 done
 if [[ $rootfs_type == ext4 ]]; then
@@ -65,7 +65,7 @@ else
     done
 fi
 
-work=${WORKDIR:-"$root/.dev/$platform-image-build"}
+work=${WORKDIR:-"$root/.dev/$platform-$rootfs_type-image-build"}
 rootfs="$work/rootfs"
 state="$work/.state"
 root_min_gib=${IMG_ROOT_GIB:-0}
@@ -83,6 +83,7 @@ gateway=${PVE_GATEWAY:-}
 dns_server=${PVE_DNS_SERVER:-}
 fqdn=""
 loop=""
+zpool_created=0
 
 [[ $root_min_gib =~ ^[0-9]+$ ]] || die "IMG_ROOT_GIB must be a non-negative integer"
 [[ $root_reserve_gib =~ ^[0-9]+$ ]] || die "IMG_ROOT_RESERVE_GIB must be a non-negative integer"
@@ -90,6 +91,27 @@ loop=""
 
 mark() { touch "$state/$1"; }
 complete() { [[ -e "$state/$1" ]]; }
+configuration_digest() {
+    printf '%s\0' \
+        "$platform" "$rootfs_type" "$mirror" "$proxmox_key_url" "$raspi_key_url" "$raspi_repo" \
+        "$root_password" "$hostname" "$domain" "$ipv4_cidr" "$gateway" "$dns_server" \
+        "$root_min_gib" "$root_reserve_gib" "$root_align_mib" |
+        sha256sum | cut -d' ' -f1
+}
+validate_build_state() {
+    local digest saved_digest stage_marker
+    digest=$(configuration_digest)
+    mkdir -p "$state"
+    if [[ -e $state/config.sha256 ]]; then
+        saved_digest=$(<"$state/config.sha256")
+        [[ $saved_digest == "$digest" ]] || die "build configuration changed; rerun with --reset or use a different WORKDIR"
+    else
+        for stage_marker in bootstrap proxmox configure assemble; do
+            [[ ! -e $state/$stage_marker ]] || die "existing build state has no configuration record; rerun with --reset"
+        done
+        printf '%s\n' "$digest" > "$state/config.sha256"
+    fi
+}
 valid_ipv4() {
     local address=$1 octet
     local -a octets
@@ -126,24 +148,22 @@ chroot_exec() {
     chroot "$rootfs" env DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8 "$@"
 }
 mount_chroot() {
-    local target=${1:-$rootfs}
-    mkdir -p "$target"/{proc,sys,dev}
+    mkdir -p "$rootfs"/{proc,sys,dev}
     for directory in proc sys dev; do
-        mountpoint -q "$target/$directory" || {
-            mount --rbind "/$directory" "$target/$directory"
-            mount --make-rslave "$target/$directory"
+        mountpoint -q "$rootfs/$directory" || {
+            mount --rbind "/$directory" "$rootfs/$directory"
+            mount --make-rslave "$rootfs/$directory"
         }
     done
 }
 unmount_chroot() {
-    local target=${1:-$rootfs}
-    umount -R -f "$target/proc" "$target/sys" "$target/dev" 2>/dev/null || true
+    umount -R -f "$rootfs/proc" "$rootfs/sys" "$rootfs/dev" 2>/dev/null || true
 }
 cleanup() {
     unmount_chroot
     if [[ -n $loop ]]; then
         umount -f "$work/mnt-boot" "$work/mnt-root" 2>/dev/null || true
-        if [[ $rootfs_type == zfs ]]; then
+        if ((zpool_created)); then
             zpool export rpool 2>/dev/null || true
         fi
         losetup -d "$loop" 2>/dev/null || true
@@ -427,8 +447,10 @@ assemble() {
         mkfs.ext4 -F -q -U "$root_uuid" -L rootfs "${loop}p2"
         mount "${loop}p2" "$work/mnt-root"
     else
+        zpool list rpool >/dev/null 2>&1 && die "refusing to use existing ZFS pool: rpool"
         zpool create -f -R "$work/mnt-root" -o ashift=12 -o cachefile=none \
             -O mountpoint=none -O compression=lz4 -O atime=off -O acltype=posixacl rpool "${loop}p2"
+        zpool_created=1
         zfs create -o mountpoint=none rpool/ROOT
         zfs create -o canmount=noauto -o mountpoint=/ rpool/ROOT/pve-1
         zfs mount rpool/ROOT/pve-1
@@ -448,6 +470,7 @@ assemble() {
         if ! zpool export -f rpool; then
             die "could not export temporary ZFS pool"
         fi
+        zpool_created=0
     else
         umount "$work/mnt-root"
     fi
@@ -467,6 +490,9 @@ if [[ $stage != clean ]]; then
 fi
 if ((reset)); then
     clean
+fi
+if [[ $stage != clean ]]; then
+    validate_build_state
 fi
 case "$stage" in
     bootstrap) bootstrap ;;
