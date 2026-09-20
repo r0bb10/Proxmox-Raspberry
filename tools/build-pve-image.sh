@@ -391,10 +391,9 @@ EOF
     cat > "$boot/cmdline.txt" <<EOF
 console=serial0,115200 console=tty1 $root_cmdline net.ifnames=0 cgroup_enable=cpuset cgroup_enable=memory cgroup_memory=1 swapaccount=1
 EOF
-    mkdir -p "$rootfs/etc/ssh/sshd_config.d" "$rootfs/etc/systemd/system/getty.target.wants"
+    mkdir -p "$rootfs/etc/ssh/sshd_config.d"
     rm -f "$rootfs/etc/network/interfaces.new"
     printf 'PermitRootLogin yes\n' > "$rootfs/etc/ssh/sshd_config.d/99-root.conf"
-    ln -sf /lib/systemd/system/serial-getty@.service "$rootfs/etc/systemd/system/getty.target.wants/serial-getty@serial0.service"
     cat > "$rootfs/etc/modprobe.d/zfs.conf" <<'EOF'
 # Preserve enough memory for PVE services on lower-memory Raspberry Pi variants.
 options zfs zfs_arc_max=1073741824
