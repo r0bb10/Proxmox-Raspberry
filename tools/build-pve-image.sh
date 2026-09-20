@@ -3,13 +3,14 @@ set -euo pipefail
 
 root=$(realpath "$(dirname "$0")/..")
 platform=${PVE_PLATFORM:-pi4}
+rootfs_type=${PVE_ROOTFS:-ext4}
 output=""
 stage=all
 reset=0
 
 usage() {
     cat <<EOF
-usage: $0 [--platform pi4|pi5] [--output PATH] [--stage STAGE] [--reset]
+usage: $0 [--platform pi4|pi5] [--rootfs ext4|zfs] [--output PATH] [--stage STAGE] [--reset]
 
 Stages: bootstrap, proxmox, configure, assemble, all, clean
 EOF
@@ -18,6 +19,7 @@ EOF
 while (($#)); do
     case "$1" in
         --platform) platform=${2:?missing value for --platform}; shift 2 ;;
+        --rootfs) rootfs_type=${2:?missing value for --rootfs}; shift 2 ;;
         --output) output=${2:?missing value for --output}; shift 2 ;;
         --stage) stage=${2:?missing value for --stage}; shift 2 ;;
         --reset) reset=1; shift ;;
@@ -46,11 +48,22 @@ case "$platform" in
         ;;
     *) die "platform must be pi4 or pi5" ;;
 esac
-[[ -n $output ]] || output="$root/dist/proxmox-ve-$platform.img"
+case "$rootfs_type" in
+    ext4|zfs) ;;
+    *) die "rootfs must be ext4 or zfs" ;;
+esac
+[[ -n $output ]] || output="$root/dist/proxmox-ve-$platform-$rootfs_type.img"
 [[ $(id -u) -eq 0 ]] || die "run as root"
-for command in curl debootstrap du gpg losetup mkfs.ext4 mkfs.vfat mount parted partprobe rsync umount; do
+for command in curl debootstrap du gpg losetup mkfs.vfat mount parted partprobe rsync umount; do
     command -v "$command" >/dev/null || die "missing command: $command"
 done
+if [[ $rootfs_type == ext4 ]]; then
+    command -v mkfs.ext4 >/dev/null || die "missing command: mkfs.ext4"
+else
+    for command in zfs zgenhostid zpool; do
+        command -v "$command" >/dev/null || die "missing command: $command"
+    done
+fi
 
 work=${WORKDIR:-"$root/.dev/$platform-image-build"}
 rootfs="$work/rootfs"
@@ -113,21 +126,26 @@ chroot_exec() {
     chroot "$rootfs" env DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8 "$@"
 }
 mount_chroot() {
-    mkdir -p "$rootfs"/{proc,sys,dev}
+    local target=${1:-$rootfs}
+    mkdir -p "$target"/{proc,sys,dev}
     for directory in proc sys dev; do
-        mountpoint -q "$rootfs/$directory" || {
-            mount --rbind "/$directory" "$rootfs/$directory"
-            mount --make-rslave "$rootfs/$directory"
+        mountpoint -q "$target/$directory" || {
+            mount --rbind "/$directory" "$target/$directory"
+            mount --make-rslave "$target/$directory"
         }
     done
 }
 unmount_chroot() {
-    umount -R -f "$rootfs/proc" "$rootfs/sys" "$rootfs/dev" 2>/dev/null || true
+    local target=${1:-$rootfs}
+    umount -R -f "$target/proc" "$target/sys" "$target/dev" 2>/dev/null || true
 }
 cleanup() {
     unmount_chroot
     if [[ -n $loop ]]; then
         umount -f "$work/mnt-boot" "$work/mnt-root" 2>/dev/null || true
+        if [[ $rootfs_type == zfs ]]; then
+            zpool export rpool 2>/dev/null || true
+        fi
         losetup -d "$loop" 2>/dev/null || true
     fi
 }
@@ -228,7 +246,7 @@ EOF
     chroot_exec apt-get update -qq
     chroot_exec apt-get install -y -qq \
         "$kernel_image_package" "$kernel_headers_package" raspi-firmware \
-        build-essential dkms zfs-dkms zfsutils-linux \
+        build-essential dkms zfs-dkms zfsutils-linux zfs-initramfs \
         raspi-utils-core raspi-utils-dt rpi-eeprom raspinfo \
         locales kmod initramfs-tools openssh-server chrony cron postfix \
         console-setup keyboard-configuration ipvsadm iputils-ping nano dialog \
@@ -277,10 +295,17 @@ configure() {
     [[ -s "$boot/start4.elf" ]] || die "Raspberry Pi firmware missing"
     [[ -s "$boot/$boot_dtb" ]] || die "Raspberry Pi $platform DTB missing"
     [[ -d "$boot/overlays" ]] || die "Raspberry Pi overlays missing"
-    [[ -s "$state/root-uuid" ]] || cat /proc/sys/kernel/random/uuid > "$state/root-uuid"
-    root_uuid=$(<"$state/root-uuid")
+    if [[ $rootfs_type == ext4 ]]; then
+        [[ -s "$state/root-uuid" ]] || cat /proc/sys/kernel/random/uuid > "$state/root-uuid"
+        root_uuid=$(<"$state/root-uuid")
+        root_fstab="UUID=$root_uuid / ext4 defaults,noatime 0 1"
+        root_cmdline="root=UUID=$root_uuid rootfstype=ext4 rootwait fsck.repair=yes"
+    else
+        root_fstab="# Root filesystem is rpool/ROOT/pve-1."
+        root_cmdline="root=ZFS=rpool/ROOT/pve-1"
+    fi
     cat > "$rootfs/etc/fstab" <<EOF
-UUID=$root_uuid / ext4 defaults,noatime 0 1
+$root_fstab
 LABEL=BOOT /boot/firmware vfat defaults 0 2
 tmpfs /tmp tmpfs defaults,nosuid 0 0
 EOF
@@ -344,7 +369,7 @@ enable_uart=1
 EOF
     printf 'kernel=%s\n' "$boot_kernel" >> "$boot/config.txt"
     cat > "$boot/cmdline.txt" <<EOF
-console=serial0,115200 console=tty1 root=UUID=$root_uuid rootfstype=ext4 rootwait fsck.repair=yes net.ifnames=0 cgroup_enable=cpuset cgroup_enable=memory cgroup_memory=1 swapaccount=1
+console=serial0,115200 console=tty1 $root_cmdline net.ifnames=0 cgroup_enable=cpuset cgroup_enable=memory cgroup_memory=1 swapaccount=1
 EOF
     mkdir -p "$rootfs/etc/ssh/sshd_config.d" "$rootfs/etc/systemd/system/getty.target.wants"
     rm -f "$rootfs/etc/network/interfaces.new"
@@ -375,7 +400,6 @@ EOF
 
 assemble() {
     complete configure || die "run configure first"
-    root_uuid=$(<"$state/root-uuid")
     boot="$rootfs/boot/firmware"
     [[ -s "$boot/$boot_kernel" && -s "$boot/$boot_initramfs" && -s "$boot/config.txt" && -s "$boot/cmdline.txt" ]] || die "Raspberry Pi boot payload incomplete"
     image="$work/image.img"
@@ -388,7 +412,7 @@ assemble() {
     root_bytes=$(((root_bytes + root_align_bytes - 1) / root_align_bytes * root_align_bytes))
     image_bytes=$((512 * 1024 * 1024 + root_bytes))
     truncate -s "$image_bytes" "$image"
-    parted -s "$image" mklabel msdos mkpart primary fat32 4MiB 516MiB set 1 lba on mkpart primary ext4 516MiB 100%
+    parted -s "$image" mklabel msdos mkpart primary fat32 4MiB 516MiB set 1 lba on mkpart primary 516MiB 100%
     loop=$(losetup -Pf --show "$image")
     for _ in {1..10}; do
         [[ -b "${loop}p1" && -b "${loop}p2" ]] && break
@@ -398,15 +422,38 @@ assemble() {
     [[ -b "${loop}p1" && -b "${loop}p2" ]] || die "loop partitions did not appear"
     mkdir -p "$work/mnt-boot" "$work/mnt-root"
     mkfs.vfat -F 32 -n BOOT "${loop}p1"
-    mkfs.ext4 -F -q -U "$root_uuid" -L rootfs "${loop}p2"
-    mount "${loop}p1" "$work/mnt-boot"
-    cp -a "$boot/." "$work/mnt-boot/"
-    umount "$work/mnt-boot"
-    mount "${loop}p2" "$work/mnt-root"
+    if [[ $rootfs_type == ext4 ]]; then
+        root_uuid=$(<"$state/root-uuid")
+        mkfs.ext4 -F -q -U "$root_uuid" -L rootfs "${loop}p2"
+        mount "${loop}p2" "$work/mnt-root"
+    else
+        zpool create -f -R "$work/mnt-root" -o ashift=12 -o cachefile=none \
+            -O mountpoint=none -O compression=lz4 -O atime=off -O acltype=posixacl rpool "${loop}p2"
+        zfs create -o mountpoint=none rpool/ROOT
+        zfs create -o canmount=noauto -o mountpoint=/ rpool/ROOT/pve-1
+        zfs mount rpool/ROOT/pve-1
+    fi
     rsync -aHAX --numeric-ids --exclude='/proc/*' --exclude='/sys/*' --exclude='/dev/*' --exclude='/tmp/*' --exclude='/boot/firmware/*' "$rootfs/" "$work/mnt-root/"
     mkdir -p "$work/mnt-root"/{dev,proc,sys,tmp,boot/firmware}
     chmod 1777 "$work/mnt-root/tmp"
-    umount "$work/mnt-root"
+    if [[ $rootfs_type == zfs ]]; then
+        mkdir -p "$work/mnt-root/etc/zfs"
+        zpool set cachefile="$work/mnt-root/etc/zfs/zpool.cache" rpool
+        chroot "$work/mnt-root" zgenhostid -f "$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"
+        cp "$work/mnt-root/etc/hostid" "$rootfs/etc/hostid"
+        mkdir -p "$rootfs/etc/zfs"
+        cp "$work/mnt-root/etc/zfs/zpool.cache" "$rootfs/etc/zfs/zpool.cache"
+        chroot_exec update-initramfs -u -k "$(kernel_release)"
+        zfs unmount -f rpool/ROOT/pve-1
+        if ! zpool export -f rpool; then
+            die "could not export temporary ZFS pool"
+        fi
+    else
+        umount "$work/mnt-root"
+    fi
+    mount "${loop}p1" "$work/mnt-boot"
+    cp -a "$boot/." "$work/mnt-boot/"
+    umount "$work/mnt-boot"
     losetup -d "$loop"
     loop=""
     mkdir -p "$(dirname "$output")"

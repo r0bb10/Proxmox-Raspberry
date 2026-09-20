@@ -11,6 +11,14 @@ on:
         options:
           - pi4
           - pi5
+      rootfs:
+        description: Root filesystem
+        required: true
+        default: ext4
+        type: choice
+        options:
+          - ext4
+          - zfs
       root_password:
         description: Root account password
         required: true
@@ -43,7 +51,7 @@ on:
         type: string
 
 concurrency:
-  group: pve-${{ inputs.platform }}-image
+  group: pve-${{ inputs.platform }}-${{ inputs.rootfs }}-image
   cancel-in-progress: false
 
 jobs:
@@ -55,6 +63,7 @@ jobs:
     env:
       PVE_ROOT_PASSWORD: ${{ inputs.root_password }}
       PVE_PLATFORM: ${{ inputs.platform }}
+      PVE_ROOTFS: ${{ inputs.rootfs }}
       PVE_HOSTNAME: ${{ inputs.hostname }}
       PVE_DOMAIN: ${{ inputs.domain }}
       PVE_IPV4_CIDR: ${{ inputs.ipv4_cidr }}
@@ -69,13 +78,15 @@ jobs:
       - name: Install image build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y debootstrap dosfstools e2fsprogs parted rsync gnupg
+          sudo apt-get install -y debootstrap dosfstools e2fsprogs parted rsync gnupg zfsutils-linux
+          sudo modprobe zfs
 
       - name: Build Raspberry Pi image
         run: |
-          sudo --preserve-env=PVE_ROOT_PASSWORD,PVE_PLATFORM,PVE_HOSTNAME,PVE_DOMAIN,PVE_IPV4_CIDR,PVE_GATEWAY,PVE_DNS_SERVER bash tools/build-pve-image.sh \
+          sudo --preserve-env=PVE_ROOT_PASSWORD,PVE_PLATFORM,PVE_ROOTFS,PVE_HOSTNAME,PVE_DOMAIN,PVE_IPV4_CIDR,PVE_GATEWAY,PVE_DNS_SERVER bash tools/build-pve-image.sh \
             --platform "$PVE_PLATFORM" \
-            --output "dist/proxmox-ve-$PVE_PLATFORM.img" \
+            --rootfs "$PVE_ROOTFS" \
+            --output "dist/proxmox-ve-$PVE_PLATFORM-$PVE_ROOTFS.img" \
             --reset
 
       - name: Record installed PVE version
@@ -87,11 +98,11 @@ jobs:
               dpkg-query -W -f='${Version}' pve-manager
           )"
           [ -n "$version" ]
-          image_name="proxmox-ve-$PVE_PLATFORM-$version"
+          image_name="proxmox-ve-$PVE_PLATFORM-$PVE_ROOTFS-$version"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
           printf 'image_name=%s\n' "$image_name" >> "$GITHUB_OUTPUT"
           printf 'IMAGE_NAME=%s\n' "$image_name" >> "$GITHUB_ENV"
-          sudo mv "dist/proxmox-ve-$PVE_PLATFORM.img" "dist/$image_name.img"
+          sudo mv "dist/proxmox-ve-$PVE_PLATFORM-$PVE_ROOTFS.img" "dist/$image_name.img"
 
       - name: Upload image artifact
         uses: actions/upload-artifact@v7
@@ -109,6 +120,7 @@ jobs:
     env:
       PVE_HOSTNAME: ${{ inputs.hostname }}
       PVE_PLATFORM: ${{ inputs.platform }}
+      PVE_ROOTFS: ${{ inputs.rootfs }}
       PVE_DOMAIN: ${{ inputs.domain }}
       PVE_IPV4_CIDR: ${{ inputs.ipv4_cidr }}
       PVE_GATEWAY: ${{ inputs.gateway }}
@@ -117,14 +129,15 @@ jobs:
       - name: Download image artifact
         uses: actions/download-artifact@v8
         with:
-          name: proxmox-ve-${{ inputs.platform }}-${{ needs.build.outputs.pve_version }}
+          name: proxmox-ve-${{ inputs.platform }}-${{ inputs.rootfs }}-${{ needs.build.outputs.pve_version }}
           path: image
 
       - name: Validate Raspberry Pi boot payload and root filesystem
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq parted
+          sudo apt-get install -y -qq parted zfsutils-linux
+          sudo modprobe zfs
           case "$PVE_PLATFORM" in
             pi4)
               boot_kernel=kernel8.img
@@ -138,12 +151,13 @@ jobs:
               ;;
             *) echo "FATAL: unsupported platform: $PVE_PLATFORM" >&2; exit 1 ;;
           esac
-          image="image/proxmox-ve-$PVE_PLATFORM-${{ needs.build.outputs.pve_version }}.img"
+          image="image/proxmox-ve-$PVE_PLATFORM-$PVE_ROOTFS-${{ needs.build.outputs.pve_version }}.img"
           boot="$(mktemp -d)"
           root="$(mktemp -d)"
           loop=""
           cleanup() {
             sudo umount "$boot" "$root" 2>/dev/null || true
+            [ "$PVE_ROOTFS" != zfs ] || sudo zpool export rpool 2>/dev/null || true
             [ -z "$loop" ] || sudo losetup -d "$loop" 2>/dev/null || true
             rm -rf "$boot" "$root"
           }
@@ -157,12 +171,19 @@ jobs:
           done
           [ -b "${loop}p1" ] && [ -b "${loop}p2" ]
           sudo mount "${loop}p1" "$boot"
-          sudo mount "${loop}p2" "$root"
           test "$(sudo blkid -s TYPE -o value "${loop}p1")" = vfat
           test "$(sudo blkid -s LABEL -o value "${loop}p1")" = BOOT
-          test "$(sudo blkid -s TYPE -o value "${loop}p2")" = ext4
-          test "$(sudo blkid -s LABEL -o value "${loop}p2")" = rootfs
-          root_uuid="$(sudo blkid -s UUID -o value "${loop}p2")"
+          if [ "$PVE_ROOTFS" = ext4 ]; then
+            sudo mount "${loop}p2" "$root"
+            test "$(sudo blkid -s TYPE -o value "${loop}p2")" = ext4
+            test "$(sudo blkid -s LABEL -o value "${loop}p2")" = rootfs
+            root_uuid="$(sudo blkid -s UUID -o value "${loop}p2")"
+          else
+            sudo zpool import -N -f -R "$root" -d /dev rpool
+            sudo zfs mount rpool/ROOT/pve-1
+            sudo zpool status rpool
+            sudo zfs list rpool/ROOT/pve-1
+          fi
           test -s "$boot/start4.elf"
           test -s "$boot/fixup4.dat"
           test -s "$boot/$boot_kernel"
@@ -174,9 +195,16 @@ jobs:
           grep -qFx 'auto_initramfs=1' "$boot/config.txt"
           grep -qFx "kernel=$boot_kernel" "$boot/config.txt"
           test "$(wc -l < "$boot/cmdline.txt")" -eq 1
-          grep -qF "root=UUID=$root_uuid " "$boot/cmdline.txt"
+          if [ "$PVE_ROOTFS" = ext4 ]; then
+            grep -qF "root=UUID=$root_uuid " "$boot/cmdline.txt"
+            grep -qFx "UUID=$root_uuid / ext4 defaults,noatime 0 1" "$root/etc/fstab"
+          else
+            grep -qF 'root=ZFS=rpool/ROOT/pve-1' "$boot/cmdline.txt"
+            grep -qFx '# Root filesystem is rpool/ROOT/pve-1.' "$root/etc/fstab"
+            test -s "$root/etc/hostid"
+            test -s "$root/etc/zfs/zpool.cache"
+          fi
           grep -qF 'console=serial0,115200' "$boot/cmdline.txt"
-          grep -qFx "UUID=$root_uuid / ext4 defaults,noatime 0 1" "$root/etc/fstab"
           grep -qFx 'LABEL=BOOT /boot/firmware vfat defaults 0 2' "$root/etc/fstab"
           fqdn="$PVE_HOSTNAME.$PVE_DOMAIN"
           sudo grep -qFx "$PVE_HOSTNAME" "$root/etc/hostname"
