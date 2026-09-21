@@ -20,6 +20,7 @@ on:
         default: false
 
 permissions:
+  actions: read
   contents: write
 
 concurrency:
@@ -262,57 +263,80 @@ jobs:
             grep -qx "$option" "$config"
           done
 
+      - name: Mark kernel package validated
+        run: touch validated
+
+      - name: Upload validation marker
+        uses: actions/upload-artifact@v7
+        with:
+          name: pve-kernel-validated-${{ needs.resolve.outputs.pve_version }}-${{ matrix.platform }}
+          path: validated
+          if-no-files-found: error
+          retention-days: 14
+
   publish:
-    needs: [resolve, preflight, build, validate]
-    if: (github.event_name == 'schedule' || inputs.platform == 'both') && needs.resolve.outputs.build == 'true' && needs.preflight.result == 'success' && needs.build.result == 'success' && needs.validate.result == 'success'
+    needs: [resolve, build, validate]
+    if: always() && needs.resolve.outputs.build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    concurrency:
+      group: pve-rpi-release-${{ needs.resolve.outputs.release_tag }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON((github.event_name == 'schedule' || inputs.platform == 'both') && '["pi4", "pi5"]' || format('["{0}"]', inputs.platform)) }}
     steps:
-      - name: Download Pi 4 kernel package
+      - name: Check platform validation
+        id: validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate --jq '.artifacts[].name' | grep -qx 'pve-kernel-validated-${{ needs.resolve.outputs.pve_version }}-${{ matrix.platform }}'; then
+            echo 'valid=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'valid=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download kernel package
+        if: steps.validation.outputs.valid == 'true'
         uses: actions/download-artifact@v8
         with:
-          name: pve-kernel-${{ needs.resolve.outputs.pve_version }}-pi4
-          path: kernel/pi4
+          name: pve-kernel-${{ needs.resolve.outputs.pve_version }}-${{ matrix.platform }}
+          path: kernel
 
-      - name: Download Pi 5 kernel package
-        uses: actions/download-artifact@v8
-        with:
-          name: pve-kernel-${{ needs.resolve.outputs.pve_version }}-pi5
-          path: kernel/pi5
-
-      - name: Publish GitHub release
+      - name: Publish validated kernel package
+        if: steps.validation.outputs.valid == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PVE_VERSION: ${{ needs.resolve.outputs.pve_version }}
           RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
-          FORCE: ${{ needs.resolve.outputs.force }}
+          PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          pi4_packages=(kernel/pi4/proxmox-kernel-"$PVE_VERSION"_*_arm64.deb)
-          pi5_packages=(kernel/pi5/proxmox-kernel-"$PVE_VERSION"_*_arm64.deb)
-          if [ "${#pi4_packages[@]}" -ne 1 ] || [ "${#pi5_packages[@]}" -ne 1 ]; then
-            echo "FATAL: expected one ARM64 kernel package for each Raspberry Pi platform" >&2
+          packages=(kernel/proxmox-kernel-"$PVE_VERSION"_*_arm64.deb)
+          if [ "${#packages[@]}" -ne 1 ]; then
+            echo "FATAL: expected one ARM64 kernel package for $PLATFORM" >&2
             exit 1
           fi
-          mkdir release
-          cp "${pi4_packages[0]}" "release/proxmox-kernel-${PVE_VERSION}-pi4_arm64.deb"
-          cp "${pi5_packages[0]}" "release/proxmox-kernel-${PVE_VERSION}-pi5_arm64.deb"
+
+          asset="proxmox-kernel-${PVE_VERSION}-${PLATFORM}_arm64.deb"
+          cp "${packages[0]}" "$asset"
           notes="${RUNNER_TEMP}/kernel-release-notes.md"
           cat > "$notes" <<EOF
           Custom ARM64 Proxmox VE kernel for Raspberry Pi.
 
-          - Includes packages for Raspberry Pi 4 and Pi 5
-          - Based on official PVE Kernel sources
-          - Install with: \`apt install ./proxmox-kernel-*_arm64.deb\`
+          Platform: Raspberry Pi 4 & 5
+          Based on official PVE Kernel sources
+          Install with: \`apt install ./proxmox-kernel-*_arm64.deb\`
           EOF
 
           if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" release/* \
+            gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "$RELEASE_TAG" \
               --notes-file "$notes"
-          elif [ "$FORCE" = 1 ]; then
-            gh release upload "$RELEASE_TAG" release/* --repo "$GITHUB_REPOSITORY" --clobber
           fi
+          gh release upload "$RELEASE_TAG" "$asset" --repo "$GITHUB_REPOSITORY" --clobber
