@@ -238,7 +238,7 @@ jobs:
 
           Platform: Raspberry Pi 4
           Raspberry Pi Linux source: $RPI_HEAD
-          Install with: \`apt install ./linux-image-$KERNEL_VERSION_arm64.deb\`
+          Install with: \`apt install ./linux-image-${KERNEL_VERSION}_arm64.deb\`
           EOF
 
           if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
