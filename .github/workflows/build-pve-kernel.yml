@@ -5,15 +5,6 @@ on:
     - cron: '22 03 * * *'
   workflow_dispatch:
     inputs:
-      platform:
-        description: Target Raspberry Pi platform(s)
-        required: true
-        default: both
-        type: choice
-        options:
-          - both
-          - pi4
-          - pi5
       force:
         description: Rebuild and replace existing release assets
         type: boolean
@@ -24,7 +15,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: pve-rpi-kernel-${{ inputs.platform || 'both' }}
+  group: rpi-pi4-kernel
   cancel-in-progress: false
 
 jobs:
@@ -34,32 +25,34 @@ jobs:
     outputs:
       build: ${{ steps.detect.outputs.build }}
       force: ${{ steps.detect.outputs.force }}
-      pve_head: ${{ steps.detect.outputs.pve_head }}
-      pve_version: ${{ steps.detect.outputs.pve_version }}
+      rpi_head: ${{ steps.detect.outputs.rpi_head }}
+      kernel_version: ${{ steps.detect.outputs.kernel_version }}
       release_tag: ${{ steps.detect.outputs.release_tag }}
     steps:
-      - name: Resolve PVE kernel source release
+      - name: Resolve Raspberry Pi kernel source release
         id: detect
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE_INPUT: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          source="${RUNNER_TEMP}/pve-kernel"
-          git clone --quiet --depth 1 --no-tags https://git.proxmox.com/git/pve-kernel.git "$source"
+          source="${RUNNER_TEMP}/rpi-linux"
+          git init --quiet "$source"
+          git -C "$source" remote add origin https://github.com/raspberrypi/linux.git
+          git -C "$source" fetch --quiet --depth 1 origin rpi-6.18.y
+          git -C "$source" checkout --quiet --detach FETCH_HEAD
 
-          pve_head="$(git -C "$source" rev-parse HEAD)"
-          makefile="$(git -C "$source" show "$pve_head:Makefile")"
-          kernel_maj="$(printf '%s\n' "$makefile" | sed -n 's/^KERNEL_MAJ=//p')"
-          kernel_min="$(printf '%s\n' "$makefile" | sed -n 's/^KERNEL_MIN=//p')"
-          kernel_patchlevel="$(printf '%s\n' "$makefile" | sed -n 's/^KERNEL_PATCHLEVEL=//p')"
-          krel="$(printf '%s\n' "$makefile" | sed -n 's/^KREL=//p')"
-          krel_extra="$(printf '%s\n' "$makefile" | sed -n 's/^KREL_EXTRA=//p')"
-          [ -n "$kernel_maj" ] && [ -n "$kernel_min" ] && [ -n "$kernel_patchlevel" ] && [ -n "$krel" ]
-          pve_version="${kernel_maj}.${kernel_min}.${kernel_patchlevel}-${krel}${krel_extra}-pve"
-          release_tag="$pve_version"
+          rpi_head="$(git -C "$source" rev-parse HEAD)"
+          makefile="$source/Makefile"
+          version="$(sed -n 's/^VERSION = //p' "$makefile")"
+          patchlevel="$(sed -n 's/^PATCHLEVEL = //p' "$makefile")"
+          sublevel="$(sed -n 's/^SUBLEVEL = //p' "$makefile")"
+          extraversion="$(sed -n 's/^EXTRAVERSION = //p' "$makefile")"
+          [ -n "$version" ] && [ -n "$patchlevel" ] && [ -n "$sublevel" ]
+          kernel_version="${version}.${patchlevel}.${sublevel}${extraversion}-rpi-v8"
+          release_tag="$kernel_version"
 
-          printf 'pve_head=%s\npve_version=%s\nrelease_tag=%s\n' "$pve_head" "$pve_version" "$release_tag" >> "$GITHUB_OUTPUT"
+          printf 'rpi_head=%s\nkernel_version=%s\nrelease_tag=%s\n' "$rpi_head" "$kernel_version" "$release_tag" >> "$GITHUB_OUTPUT"
           force=0
           [ "$FORCE_INPUT" != true ] || force=1
           printf 'force=%s\n' "$force" >> "$GITHUB_OUTPUT"
@@ -71,75 +64,36 @@ jobs:
             echo 'build=true' >> "$GITHUB_OUTPUT"
           fi
 
-  preflight:
-    needs: resolve
-    if: needs.resolve.outputs.build == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: ${{ fromJSON((github.event_name == 'schedule' || inputs.platform == 'both') && '["pi4", "pi5"]' || format('["{0}"]', inputs.platform)) }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Verify Raspberry Pi packaging patches
-        env:
-          PVE_HEAD: ${{ needs.resolve.outputs.pve_head }}
-          PLATFORM: ${{ matrix.platform }}
-        run: |
-          set -euo pipefail
-          source="${RUNNER_TEMP}/pve-kernel"
-          git clone --quiet --depth 1 --no-tags https://git.proxmox.com/git/pve-kernel.git "$source"
-          if [ "$(git -C "$source" rev-parse HEAD)" != "$PVE_HEAD" ]; then
-            git -C "$source" fetch --quiet --depth 1 origin "$PVE_HEAD"
-            git -C "$source" checkout --quiet FETCH_HEAD
-          fi
-
-          case "$PLATFORM" in
-            pi4) boot_kernel=kernel8.img; boot_initramfs=initramfs8; boot_dtb=bcm2711-rpi-4-b.dtb ;;
-            pi5) boot_kernel=kernel_2712.img; boot_initramfs=initramfs_2712; boot_dtb=bcm2712-rpi-5-b.dtb ;;
-            *) echo "FATAL: unsupported platform: $PLATFORM" >&2; exit 1 ;;
-          esac
-          patch="${RUNNER_TEMP}/boot.patch"
-          sed \
-            -e "s|@BOOT_KERNEL@|$boot_kernel|g" \
-            -e "s|@BOOT_INITRAMFS@|$boot_initramfs|g" \
-            -e "s|@BOOT_DTB@|$boot_dtb|g" \
-            patches/boot.patch > "$patch"
-          git -C "$source" apply --unidiff-zero --check "$patch"
-
   build:
     needs: resolve
     if: needs.resolve.outputs.build == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: ${{ fromJSON((github.event_name == 'schedule' || inputs.platform == 'both') && '["pi4", "pi5"]' || format('["{0}"]', inputs.platform)) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Build native ARM64 PVE packages
+      - name: Build native ARM64 Raspberry Pi package
         env:
-          PVE_HEAD: ${{ needs.resolve.outputs.pve_head }}
-          PVE_PLATFORM: ${{ matrix.platform }}
+          RPI_HEAD: ${{ needs.resolve.outputs.rpi_head }}
+          RPI_FLAVOUR: v8
+          ZFS_VERSION: 2.4.4
+          KBUILD_BUILD_VERSION: 1
         run: |
           docker run --rm \
             --platform linux/arm64 \
             --volume "${GITHUB_WORKSPACE}:/workspace" \
             --workdir /workspace \
             --env WORK_DIR=/workspace/work \
-            --env PVE_HEAD \
-            --env PVE_PLATFORM \
+            --env RPI_HEAD \
+            --env RPI_FLAVOUR \
+            --env ZFS_VERSION \
+            --env KBUILD_BUILD_VERSION \
             debian:trixie \
             bash -euo pipefail -c '
               export DEBIAN_FRONTEND=noninteractive
               apt-get update -qq
-              apt-get install -y -qq build-essential bison ca-certificates devscripts dh-python equivs flex git patch python3 sphinx-common
+              apt-get install -y -qq autoconf automake bc bison build-essential ca-certificates cpio dwarves flex gawk gettext git libaio-dev libattr1-dev libblkid-dev libelf-dev libncurses-dev libssl-dev libtirpc-dev libtool libudev-dev pkg-config python3 rsync uuid-dev xz-utils zlib1g-dev
               git config --global --add safe.directory /workspace
               bash tools/build-pve-kernel.sh
             '
@@ -147,8 +101,11 @@ jobs:
       - name: Upload kernel package
         uses: actions/upload-artifact@v7
         with:
-          name: pve-kernel-${{ needs.resolve.outputs.pve_version }}-${{ matrix.platform }}
-          path: work/pve-kernel/proxmox-kernel-${{ needs.resolve.outputs.pve_version }}_*_arm64.deb
+          name: rpi-kernel-${{ needs.resolve.outputs.kernel_version }}
+          path: |
+            .artifacts/packages/*.deb
+            .artifacts/packages/*.sha256
+            .artifacts/packages/build-manifest.txt
           if-no-files-found: error
           retention-days: 14
 
@@ -157,27 +114,22 @@ jobs:
     if: needs.resolve.outputs.build == 'true' && needs.build.result == 'success'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: ${{ fromJSON((github.event_name == 'schedule' || inputs.platform == 'both') && '["pi4", "pi5"]' || format('["{0}"]', inputs.platform)) }}
     steps:
       - name: Download kernel package
         uses: actions/download-artifact@v8
         with:
-          name: pve-kernel-${{ needs.resolve.outputs.pve_version }}-${{ matrix.platform }}
+          name: rpi-kernel-${{ needs.resolve.outputs.kernel_version }}
           path: kernel
 
       - name: Validate Raspberry Pi kernel payload
         env:
-          PVE_VERSION: ${{ needs.resolve.outputs.pve_version }}
-          PLATFORM: ${{ matrix.platform }}
+          KERNEL_VERSION: ${{ needs.resolve.outputs.kernel_version }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          packages=(kernel/proxmox-kernel-"$PVE_VERSION"_*_arm64.deb)
+          packages=(kernel/linux-image-"$KERNEL_VERSION"_arm64.deb)
           if [ "${#packages[@]}" -ne 1 ]; then
-            echo "FATAL: expected one ARM64 proxmox-kernel package" >&2
+            echo "FATAL: expected one ARM64 linux-image package" >&2
             exit 1
           fi
           contents="$(mktemp)"
@@ -187,40 +139,23 @@ jobs:
           dpkg-deb --contents "${packages[0]}" > "$contents"
           dpkg-deb --extract "${packages[0]}" "$package_root"
           dpkg-deb --control "${packages[0]}" "$control_root"
-          if grep -qE ' \./boot/(vmlinuz|System\.map)-' "$contents"; then
-            echo "FATAL: package must not own a bootable kernel or System.map under /boot" >&2
-            exit 1
-          fi
-          case "$PLATFORM" in
-            pi4)
-              dtb=bcm2711-rpi-4-b.dtb; boot_initramfs=initramfs8
-              platform_options=(CONFIG_PCIE_BRCMSTB=y)
-              ;;
-            pi5)
-              dtb=bcm2712-rpi-5-b.dtb; boot_initramfs=initramfs_2712
-              platform_options=(CONFIG_PCIE_BRCMSTB=y CONFIG_PINCTRL_RP1=y)
-              ;;
-            *) echo "FATAL: unsupported platform: $PLATFORM" >&2; exit 1 ;;
-          esac
-          grep -qE " \./usr/lib/proxmox-kernel/.*/Image\.gz$" "$contents"
-          grep -qE " \./usr/lib/proxmox-kernel/.*/$dtb$" "$contents"
-          grep -qE ' \./usr/lib/modules/.*/zfs/zfs\.ko' "$contents"
+          grep -qE " \./usr/lib/linux-image-$KERNEL_VERSION/broadcom/bcm2711-rpi-4-b\.dtb$" "$contents"
+          grep -qE " \./lib/modules/$KERNEL_VERSION/updates/zfs/spl\.ko$" "$contents"
+          grep -qE " \./lib/modules/$KERNEL_VERSION/updates/zfs/zfs\.ko$" "$contents"
 
-          image="$(find "$package_root/usr/lib/proxmox-kernel" -name Image.gz -type f -print -quit)"
-          config="$package_root/boot/config-$PVE_VERSION"
-          hook="$package_root/etc/initramfs/post-update.d/z50-proxmox-kernel-${PVE_VERSION//./_}"
+          image="$package_root/boot/vmlinuz-$KERNEL_VERSION"
+          config="$package_root/boot/config-$KERNEL_VERSION"
+          spl_module="$package_root/lib/modules/$KERNEL_VERSION/updates/zfs/spl.ko"
+          zfs_module="$package_root/lib/modules/$KERNEL_VERSION/updates/zfs/zfs.ko"
           postinst="$control_root/postinst"
-          test -n "$image"
+          test -s "$image"
           test -s "$config"
-          test -x "$hook"
-          bash -n "$hook"
-          grep -qx "version=$PVE_VERSION" "$hook"
-          grep -qx 'if ! mountpoint -q "$firmware_dir"; then' "$hook"
-          grep -qx "install -m 0644 \"\$initrd\" \"\$firmware_dir/$boot_initramfs\"" "$hook"
-          ! grep -Fq 'Failed to deploy Raspberry Pi initramfs' "$postinst"
+          grep -qx 'Provides: zfs-modules' "$control_root/control"
+          grep -Fq 'DEB_MAINT_PARAMS=configure run-parts' "$postinst"
           gzip -t "$image"
-          arm_magic="$(gzip -cd "$image" | { dd bs=1 skip=56 count=4 status=none; cat >/dev/null; })"
-          test "$arm_magic" = 'ARMd'
+          gzip -cd "$image" | strings | grep -Fq "#1 SMP PREEMPT_DYNAMIC PMX ${KERNEL_VERSION%-rpi-*} ("
+          [[ $(modinfo -F vermagic "$spl_module") == "$KERNEL_VERSION"* ]]
+          [[ $(modinfo -F vermagic "$zfs_module") == "$KERNEL_VERSION"* ]]
 
           for option in \
             CONFIG_ARCH_BCM2835=y \
@@ -236,6 +171,7 @@ jobs:
             CONFIG_BLK_DEV_INITRD=y \
             CONFIG_RD_ZSTD=y \
             CONFIG_KSM=y \
+            CONFIG_PREEMPT_DYNAMIC=y \
             CONFIG_IPV6=y \
             CONFIG_KVM=y \
             CONFIG_SECCOMP=y \
@@ -257,79 +193,52 @@ jobs:
             CONFIG_VIRTIO_MMIO=y \
             CONFIG_NETFILTER_XTABLES=m \
             CONFIG_IP_NF_IPTABLES=m \
+            CONFIG_IP_NF_RAW=m \
             CONFIG_IP6_NF_IPTABLES=m \
+            CONFIG_IP6_NF_RAW=m \
+            CONFIG_BRIDGE_EBT_T_FILTER=m \
             CONFIG_NFT_COMPAT=m \
-            "${platform_options[@]}"; do
+            CONFIG_LOCALVERSION=\"-rpi-v8\"; do
             grep -qx "$option" "$config"
           done
 
-      - name: Mark kernel package validated
-        run: touch validated
-
-      - name: Upload validation marker
-        uses: actions/upload-artifact@v7
-        with:
-          name: pve-kernel-validated-${{ needs.resolve.outputs.pve_version }}-${{ matrix.platform }}
-          path: validated
-          if-no-files-found: error
-          retention-days: 14
-
   publish:
     needs: [resolve, build, validate]
-    if: always() && needs.resolve.outputs.build == 'true'
+    if: needs.resolve.outputs.build == 'true' && needs.validate.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     concurrency:
       group: pve-rpi-release-${{ needs.resolve.outputs.release_tag }}
       cancel-in-progress: false
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: ${{ fromJSON((github.event_name == 'schedule' || inputs.platform == 'both') && '["pi4", "pi5"]' || format('["{0}"]', inputs.platform)) }}
     steps:
-      - name: Check platform validation
-        id: validation
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate --jq '.artifacts[].name' | grep -qx 'pve-kernel-validated-${{ needs.resolve.outputs.pve_version }}-${{ matrix.platform }}'; then
-            echo 'valid=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'valid=false' >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Download kernel package
-        if: steps.validation.outputs.valid == 'true'
         uses: actions/download-artifact@v8
         with:
-          name: pve-kernel-${{ needs.resolve.outputs.pve_version }}-${{ matrix.platform }}
+          name: rpi-kernel-${{ needs.resolve.outputs.kernel_version }}
           path: kernel
 
       - name: Publish validated kernel package
-        if: steps.validation.outputs.valid == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          PVE_VERSION: ${{ needs.resolve.outputs.pve_version }}
+          KERNEL_VERSION: ${{ needs.resolve.outputs.kernel_version }}
           RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
-          PLATFORM: ${{ matrix.platform }}
+          RPI_HEAD: ${{ needs.resolve.outputs.rpi_head }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          packages=(kernel/proxmox-kernel-"$PVE_VERSION"_*_arm64.deb)
+          packages=(kernel/linux-image-"$KERNEL_VERSION"_arm64.deb)
           if [ "${#packages[@]}" -ne 1 ]; then
-            echo "FATAL: expected one ARM64 kernel package for $PLATFORM" >&2
+            echo "FATAL: expected one ARM64 kernel package" >&2
             exit 1
           fi
 
-          asset="proxmox-kernel-${PVE_VERSION}-${PLATFORM}_arm64.deb"
-          cp "${packages[0]}" "$asset"
           notes="${RUNNER_TEMP}/kernel-release-notes.md"
           cat > "$notes" <<EOF
           Custom ARM64 Proxmox VE kernel for Raspberry Pi.
 
-          Platform: Raspberry Pi 4 & 5
-          Based on official PVE Kernel sources
-          Install with: \`apt install ./proxmox-kernel-*_arm64.deb\`
+          Platform: Raspberry Pi 4
+          Raspberry Pi Linux source: $RPI_HEAD
+          Install with: \`apt install ./linux-image-$KERNEL_VERSION_arm64.deb\`
           EOF
 
           if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -339,4 +248,4 @@ jobs:
               --title "$RELEASE_TAG" \
               --notes-file "$notes"
           fi
-          gh release upload "$RELEASE_TAG" "$asset" --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload "$RELEASE_TAG" kernel/* --repo "$GITHUB_REPOSITORY" --clobber
