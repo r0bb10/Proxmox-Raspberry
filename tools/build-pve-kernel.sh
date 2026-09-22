@@ -40,8 +40,10 @@ while IFS= read -r option; do
     read -r -a arguments <<< "$option"
     "$source/scripts/config" --file "$build/.config" "${arguments[@]}"
 done < "$root/configs/proxmox.opts"
-"$source/scripts/config" --file "$build/.config" --set-str CONFIG_LOCALVERSION "-rpi-$rpi_flavour"
 make -C "$source" O="$build" ARCH=arm64 olddefconfig
+# Raspberry Pi's defconfig owns the hardware suffix (for example, -v8).
+# A build-tree localversion file prefixes it without replacing that suffix.
+printf '%s\n' '-rpi' > "$build/localversion-pmx"
 
 kernel_base=$(make -s -C "$source" O="$build" ARCH=arm64 LOCALVERSION='' kernelrelease)
 [[ $kernel_base == *-rpi-"$rpi_flavour" ]] || die "unexpected kernel release: $kernel_base"

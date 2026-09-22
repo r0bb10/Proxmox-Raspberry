@@ -198,7 +198,7 @@ jobs:
             CONFIG_IP6_NF_RAW=m \
             CONFIG_BRIDGE_EBT_T_FILTER=m \
             CONFIG_NFT_COMPAT=m \
-            CONFIG_LOCALVERSION=\"-rpi-v8\"; do
+            CONFIG_LOCALVERSION=\"-v8\"; do
             grep -qx "$option" "$config"
           done
 
