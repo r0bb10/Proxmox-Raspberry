@@ -28,11 +28,13 @@ dns_server=${PVE_DNS_SERVER:?PVE_DNS_SERVER is required}
 
 case "$platform" in
     pi4)
+        stock_kernel_package=linux-image-rpi-v8
         boot_kernel=kernel8.img
         boot_initramfs=initramfs8
         boot_dtb=bcm2711-rpi-4-b.dtb
         ;;
     pi5)
+        stock_kernel_package=linux-image-rpi-2712
         boot_kernel=kernel_2712.img
         boot_initramfs=initramfs_2712
         boot_dtb=bcm2712-rpi-5-b.dtb
@@ -120,4 +122,13 @@ grep -qFx "    address $ipv4_cidr" "$root/etc/network/interfaces"
 grep -qFx "    gateway $gateway" "$root/etc/network/interfaces"
 grep -qFx "    dns-nameservers $dns_server" "$root/etc/network/interfaces"
 [[ -s $root/etc/modprobe.d/zfs.conf ]]
-chroot "$root" dpkg-query -W pve-edk2-firmware pve-edk2-firmware-aarch64 pve-firmware
+chroot "$root" dpkg-query -W pve-edk2-firmware pve-edk2-firmware-aarch64 bluez-firmware firmware-brcm80211
+pve_firmware_version=$(chroot "$root" dpkg-query -W -f='${Version}' pve-firmware)
+[[ $pve_firmware_version == *+rpi1 ]]
+grep -qFx 'Package: pve-firmware' "$root/etc/apt/preferences.d/pve-firmware-rpi"
+grep -qFx 'Pin: version *' "$root/etc/apt/preferences.d/pve-firmware-rpi"
+grep -qFx 'Pin-Priority: -1' "$root/etc/apt/preferences.d/pve-firmware-rpi"
+if chroot "$root" dpkg-query -W "$stock_kernel_package" >/dev/null 2>&1; then
+    printf 'error: stock Raspberry Pi kernel package must not be installed\n' >&2
+    exit 1
+fi

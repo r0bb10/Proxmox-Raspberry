@@ -14,6 +14,7 @@ usage() {
 usage: $0 --kernel-deb PATH [--platform pi4|pi5] [--rootfs ext4|zfs] [--output PATH] [--stage STAGE] [--reset]
 
 Stages: bootstrap, proxmox, configure, assemble, all, clean
+The clean stage does not require --kernel-deb.
 EOF
 }
 
@@ -31,6 +32,10 @@ while (($#)); do
 done
 
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
+case "$stage" in
+    bootstrap|proxmox|configure|assemble|all|clean) ;;
+    *) die "unknown stage: $stage" ;;
+esac
 case "$platform" in
     pi4)
         kernel_modules_suffix=-rpi-v8
@@ -52,28 +57,31 @@ case "$rootfs_type" in
 esac
 [[ -n $output ]] || output="$root/dist/proxmox-ve-$platform-$rootfs_type.img"
 [[ $(id -u) -eq 0 ]] || die "run as root"
-[[ -f $kernel_deb ]] || die "--kernel-deb must name an existing package"
-for command in curl debootstrap dpkg-deb du gpg losetup mkfs.vfat mount parted partprobe rsync sha256sum umount; do
-    command -v "$command" >/dev/null || die "missing command: $command"
-done
-if [[ $rootfs_type == ext4 ]]; then
-    command -v mkfs.ext4 >/dev/null || die "missing command: mkfs.ext4"
-else
-    for command in zfs zgenhostid zpool; do
+command -v umount >/dev/null || die "missing command: umount"
+if [[ $stage != clean ]]; then
+    [[ -f $kernel_deb ]] || die "--kernel-deb must name an existing package"
+    for command in curl debootstrap dpkg-deb du gpg losetup mkfs.vfat mount parted partprobe rsync sha256sum; do
         command -v "$command" >/dev/null || die "missing command: $command"
     done
-fi
+    if [[ $rootfs_type == ext4 ]]; then
+        command -v mkfs.ext4 >/dev/null || die "missing command: mkfs.ext4"
+    else
+        for command in zfs zgenhostid zpool; do
+            command -v "$command" >/dev/null || die "missing command: $command"
+        done
+    fi
 
-kernel_package=$(dpkg-deb -f "$kernel_deb" Package)
-kernel_package_version=$(dpkg-deb -f "$kernel_deb" Version)
-kernel_package_architecture=$(dpkg-deb -f "$kernel_deb" Architecture)
-kernel_package_sha256=$(sha256sum "$kernel_deb" | cut -d' ' -f1)
-[[ $kernel_package == linux-image-* ]] || die "kernel package must be named linux-image-*"
-[[ $kernel_package_architecture == arm64 ]] || die "kernel package must target arm64"
-case "$platform" in
-    pi4) [[ $kernel_package_version == *-rpi-v8 ]] || die "kernel package is not a Pi 4 rpi-v8 build" ;;
-    pi5) [[ $kernel_package_version == *-rpi-2712 ]] || die "kernel package is not a Pi 5 rpi-2712 build" ;;
-esac
+    kernel_package=$(dpkg-deb -f "$kernel_deb" Package)
+    kernel_package_version=$(dpkg-deb -f "$kernel_deb" Version)
+    kernel_package_architecture=$(dpkg-deb -f "$kernel_deb" Architecture)
+    kernel_package_sha256=$(sha256sum "$kernel_deb" | cut -d' ' -f1)
+    [[ $kernel_package == linux-image-* ]] || die "kernel package must be named linux-image-*"
+    [[ $kernel_package_architecture == arm64 ]] || die "kernel package must target arm64"
+    case "$platform" in
+        pi4) [[ $kernel_package_version == *-rpi-v8 ]] || die "kernel package is not a Pi 4 rpi-v8 build" ;;
+        pi5) [[ $kernel_package_version == *-rpi-2712 ]] || die "kernel package is not a Pi 5 rpi-2712 build" ;;
+    esac
+fi
 
 work=${WORKDIR:-"$root/.dev/$platform-$rootfs_type-image-build"}
 rootfs="$work/rootfs"
@@ -227,6 +235,29 @@ clean() {
     rm -rf "$work"
 }
 
+install_pve_firmware_placeholder() {
+    local package_dir version
+
+    version=$(chroot_exec apt-cache show pve-firmware | sed -n 's/^Version: //p' | sort -V | tail -n 1)
+    [[ -n $version ]] || die "could not determine the pve-firmware version"
+
+    package_dir=/tmp/pve-firmware-placeholder
+    rm -rf "$rootfs$package_dir"
+    mkdir -p "$rootfs$package_dir/DEBIAN"
+    cat > "$rootfs$package_dir/DEBIAN/control" <<EOF
+Package: pve-firmware
+Version: ${version}+rpi1
+Architecture: all
+Maintainer: Proxmox Raspberry Build <root@localhost>
+Description: Placeholder for Proxmox firmware on Raspberry Pi
+ The Raspberry Pi image uses firmware-brcm80211, which conflicts with the
+ official pve-firmware package. This package intentionally contains no files.
+EOF
+    chroot_exec dpkg-deb --root-owner-group --build "$package_dir" /tmp/pve-firmware-placeholder.deb >/dev/null
+    chroot_exec dpkg -i /tmp/pve-firmware-placeholder.deb
+    rm -rf "$rootfs$package_dir" "$rootfs/tmp/pve-firmware-placeholder.deb"
+}
+
 bootstrap() {
     complete bootstrap && return
     mkdir -p "$work" "$state"
@@ -278,6 +309,7 @@ EOF
     chroot_exec apt-get install -y -qq \
         raspi-firmware \
         raspi-utils-core raspi-utils-dt rpi-eeprom raspinfo \
+        bluez-firmware firmware-brcm80211 \
         locales kmod initramfs-tools openssh-server chrony cron postfix \
         console-setup keyboard-configuration ipvsadm iputils-ping nano dialog \
         parted bsdextrautils tar dosfstools e2fsprogs fdisk util-linux rsync
@@ -302,7 +334,12 @@ Architectures: arm64 amd64
 Signed-By: /etc/apt/keyrings/proxmox-archive-keyring.gpg
 EOF
     cat > "$rootfs/etc/apt/preferences.d/no-proxmox-kernels" <<'EOF'
-Package: proxmox-ve proxmox-default-kernel proxmox-kernel-* linux-image-rpi-*-rt linux-image-*-rpi-*-rt linux-headers-rpi-*-rt linux-headers-*-rpi-*-rt
+Package: proxmox-ve proxmox-default-kernel proxmox-kernel-* linux-image-rpi-v8 linux-image-rpi-2712 linux-image-rpi-*-rt linux-image-*-rpi-*-rt linux-headers-rpi-*-rt linux-headers-*-rpi-*-rt
+Pin: version *
+Pin-Priority: -1
+EOF
+    cat > "$rootfs/etc/apt/preferences.d/pve-firmware-rpi" <<'EOF'
+Package: pve-firmware
 Pin: version *
 Pin-Priority: -1
 EOF
@@ -312,7 +349,9 @@ EOF
     sed -i 's|/etc/apt/keyrings/proxmox-archive-keyring.gpg|/usr/share/keyrings/proxmox-archive-keyring.gpg|' "$rootfs/etc/apt/sources.list.d/proxmox.sources"
     chroot_exec apt-get install -y -qq \
         ifupdown2 ksm-control-daemon pve-manager pve-qemu-kvm qemu-server \
-        pve-edk2-firmware pve-edk2-firmware-aarch64 pve-firmware isc-dhcp-client
+        pve-edk2-firmware pve-edk2-firmware-aarch64 isc-dhcp-client
+    chroot_exec apt-get purge -y -qq pve-firmware
+    install_pve_firmware_placeholder
     mark proxmox
 }
 
@@ -513,5 +552,4 @@ case "$stage" in
     assemble) assemble ;;
     all) bootstrap; proxmox; configure; assemble ;;
     clean) clean ;;
-    *) die "unknown stage: $stage" ;;
 esac
