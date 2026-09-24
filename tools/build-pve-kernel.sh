@@ -1,87 +1,123 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-export GIT_TERMINAL_PROMPT=0
+shopt -s nullglob
 
 root=$(realpath "$(dirname "$0")/..")
 work=${WORK_DIR:-"$root/work"}
-pve_source="$work/pve-kernel"
-pve_git_url=https://git.proxmox.com/git/pve-kernel.git
-pve_head=${PVE_HEAD:?PVE_HEAD must be resolved by the workflow}
-platform=${PVE_PLATFORM:-pi4}
+source="$work/rpi-linux"
+build="$work/rpi-linux-build"
+zfs="$work/zfs-${ZFS_VERSION:-2.4.4}"
+output=${ARTIFACT_DIR:-"$root/.artifacts/packages"}
+rpi_head=${RPI_HEAD:?RPI_HEAD must be resolved by the workflow}
+rpi_git_url=${RPI_GIT_URL:-https://github.com/raspberrypi/linux.git}
+rpi_flavour=${RPI_FLAVOUR:-v8}
+zfs_version=${ZFS_VERSION:-2.4.4}
+zfs_ref=${ZFS_REF:-zfs-$zfs_version}
+jobs=${JOBS:-$(nproc)}
 
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
 
-# Select platform-specific firmware filenames and configuration inputs.
 [[ $(dpkg --print-architecture) == arm64 ]] || die "native arm64 build required"
+[[ $rpi_head =~ ^[0-9a-f]{40}$ ]] || die "invalid RPI_HEAD"
+[[ $rpi_flavour == v8 ]] || die "Pi 4 builds require RPI_FLAVOUR=v8"
+[[ -f $root/configs/proxmox.opts ]] || die "missing configs/proxmox.opts"
+[[ -f $root/patches/kernel.patch ]] || die "missing PMX metadata patch"
 
-case "$platform" in
-    pi4)
-        boot_kernel=kernel8.img
-        boot_initramfs=initramfs8
-        boot_dtb=bcm2711-rpi-4-b.dtb
-        raspi_config="$root/configs/raspberry-pi4.config"
-        raspi_opts="$root/configs/raspberry-pi4.opts"
-        ;;
-    pi5)
-        boot_kernel=kernel_2712.img
-        boot_initramfs=initramfs_2712
-        boot_dtb=bcm2712-rpi-5-b.dtb
-        raspi_config="$root/configs/raspberry-pi5.config"
-        raspi_opts="$root/configs/raspberry-pi5.opts"
-        ;;
-    *) die "PVE_PLATFORM must be pi4 or pi5" ;;
-esac
+rm -rf "$source" "$build" "$zfs"
+mkdir -p "$work" "$output"
 
-# Verify the repository inputs before downloading build sources.
-for file in \
-    "$root/patches/boot.patch" \
-    "$raspi_config" \
-    "$raspi_opts" \
-    "$root/configs/proxmox.opts"; do
-    [[ -f $file ]] || die "missing scaffold input: $file"
-done
+git init --quiet "$source"
+git -C "$source" remote add origin "$rpi_git_url"
+git -C "$source" fetch --quiet --depth 1 origin "$rpi_head"
+git -C "$source" checkout --quiet --detach FETCH_HEAD
+[[ $(git -C "$source" rev-parse HEAD) == "$rpi_head" ]] || die "Raspberry Pi source revision mismatch"
+git -C "$source" apply --check "$root/patches/kernel.patch"
+git -C "$source" apply "$root/patches/kernel.patch"
 
-mkdir -p "$work"
-[[ $pve_head =~ ^[0-9a-f]{40}$ ]] || die "invalid PVE_HEAD"
-
-# Fetch the exact PVE source revision resolved by the workflow.
-rm -rf "$pve_source"
-git clone --quiet --depth 1 --no-tags "$pve_git_url" "$pve_source"
-if [[ $(git -C "$pve_source" rev-parse HEAD) != "$pve_head" ]]; then
-    git -C "$pve_source" fetch --quiet --depth 1 origin "$pve_head"
-    git -C "$pve_source" checkout --quiet FETCH_HEAD
-fi
-
-printf 'PVE_HEAD=%s\nPI_CONFIG=%s\n' "$pve_head" "$raspi_config"
-
-# Adapt PVE package installation for Raspberry Pi firmware boot files.
-boot_patch="$work/boot.patch"
-sed \
-    -e "s|@BOOT_KERNEL@|$boot_kernel|g" \
-    -e "s|@BOOT_INITRAMFS@|$boot_initramfs|g" \
-    -e "s|@BOOT_DTB@|$boot_dtb|g" \
-    "$root/patches/boot.patch" > "$boot_patch"
-git -C "$pve_source" apply --unidiff-zero --check "$boot_patch"
-git -C "$pve_source" apply --unidiff-zero "$boot_patch"
-
-# Replace PVE's generic ARM64 baseline with the checked-in Pi base config.
-: > "$pve_source/debian/rules.d/config-arm64.opts"
+make -C "$source" O="$build" ARCH=arm64 bcm2711_defconfig
 while IFS= read -r option; do
     [[ -z $option || $option == \#* ]] && continue
-    printf '%s\n' "$option" >> "$pve_source/debian/rules.d/config-arm64.opts"
-done < <(cat "$raspi_opts" "$root/configs/proxmox.opts")
+    read -r -a arguments <<< "$option"
+    "$source/scripts/config" --file "$build/.config" "${arguments[@]}"
+done < "$root/configs/proxmox.opts"
+make -C "$source" O="$build" ARCH=arm64 olddefconfig
+# Raspberry Pi's defconfig owns the hardware suffix (for example, -v8).
+# A build-tree localversion file prefixes it without replacing that suffix.
+printf '%s\n' '-rpi' > "$build/localversion-pmx"
 
-# Prepare the PVE package tree, resolve its configuration, and build packages.
-kernel_version=$(sed -n 's/^KERNEL_MAJ=//p' "$pve_source/Makefile").$(sed -n 's/^KERNEL_MIN=//p' "$pve_source/Makefile").$(sed -n 's/^KERNEL_PATCHLEVEL=//p' "$pve_source/Makefile")
-build_dir="$pve_source/proxmox-kernel-$kernel_version"
+kernel_base=$(make -s -C "$source" O="$build" ARCH=arm64 LOCALVERSION='' kernelrelease)
+[[ $kernel_base == *-rpi-"$rpi_flavour" ]] || die "unexpected kernel release: $kernel_base"
+timestamp=${KBUILD_BUILD_VERSION_TIMESTAMP:-"PMX ${kernel_base%-rpi-*} ($(date -u +%Y-%m-%dT%H:%MZ))"}
+export KBUILD_BUILD_VERSION=${KBUILD_BUILD_VERSION:-1}
+export KBUILD_BUILD_TIMESTAMP=${KBUILD_BUILD_TIMESTAMP:-$timestamp}
+export KBUILD_BUILD_VERSION_TIMESTAMP=$timestamp
+export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$source" show -s --format=%ct HEAD)}
 
+make -C "$source" O="$build" ARCH=arm64 LOCALVERSION='' -j"$jobs" Image modules dtbs modules_prepare
+
+git clone --quiet --depth 1 --branch "$zfs_ref" https://github.com/openzfs/zfs.git "$zfs"
 (
-    cd "$pve_source"
-    make build-dir-fresh
-    cp "$raspi_config" "$build_dir/ubuntu-kernel/.config"
-    mk-build-deps -ir --tool 'apt-get -y --no-install-recommends' "$build_dir/debian/control"
-    make -C "$build_dir" -f debian/rules .config_mark
-    make deb
+    cd "$zfs"
+    sh autogen.sh
+    ./configure --with-linux="$source" --with-linux-obj="$build"
+    make -j"$jobs"
 )
 
-printf 'Built PVE Raspberry Pi kernel packages in %s\n' "$pve_source"
+version=$(make -s -C "$source" O="$build" ARCH=arm64 LOCALVERSION='' kernelrelease)
+package="$output/stage/linux-image-$version"
+firmware="$package/usr/lib/linux-image-$version"
+dtbs="$build/arch/arm64/boot/dts"
+overlay_readme="$source/arch/arm64/boot/dts/overlays/README"
+
+for required in \
+    "$build/arch/arm64/boot/Image" \
+    "$dtbs/broadcom/bcm2711-rpi-4-b.dtb" \
+    "$overlay_readme" \
+    "$zfs/module/spl.ko" \
+    "$zfs/module/zfs.ko"; do
+    [[ -f $required ]] || die "missing build artifact: $required"
+done
+
+rm -rf "$output/stage"
+mkdir -p "$package/DEBIAN" "$firmware/broadcom" "$firmware/overlays"
+install -D -m 0644 "$build/.config" "$package/boot/config-$version"
+install -D -m 0644 "$build/System.map" "$package/boot/System.map-$version"
+gzip -n -9 -c "$build/arch/arm64/boot/Image" > "$package/boot/vmlinuz-$version"
+install -m 0644 "$dtbs/broadcom/"*.dtb "$firmware/broadcom/"
+install -m 0644 "$dtbs/overlays/"*.dtbo "$dtbs/overlays/"*.dtb "$firmware/overlays/"
+install -m 0644 "$overlay_readme" "$firmware/overlays/README"
+make -C "$source" O="$build" ARCH=arm64 LOCALVERSION='' DEPMOD=/bin/true INSTALL_MOD_PATH="$package" modules_install
+install -D -m 0644 "$zfs/module/spl.ko" "$package/lib/modules/$version/updates/zfs/spl.ko"
+install -D -m 0644 "$zfs/module/zfs.ko" "$package/lib/modules/$version/updates/zfs/zfs.ko"
+
+cat > "$package/DEBIAN/control" <<EOF
+Package: linux-image-$version
+Version: $version
+Section: kernel
+Priority: optional
+Architecture: arm64
+Maintainer: Proxmox Raspberry Build <root@localhost>
+Depends: initramfs-tools, kmod, zfs-initramfs, zfsutils-linux (>= $zfs_version), zfsutils-linux (<< ${zfs_version%.*}.$((${zfs_version##*.} + 1)))
+Provides: zfs-modules
+Description: Raspberry Pi 4 Proxmox kernel and OpenZFS modules $version
+ Custom Raspberry Pi kernel with Proxmox host features and matched OpenZFS modules.
+EOF
+
+cat > "$package/DEBIAN/postinst" <<EOF
+#!/bin/sh
+set -eu
+version=$version
+image=/boot/vmlinuz-\$version
+
+depmod "\$version"
+if [ -e /boot/initrd.img-\$version ]; then
+    update-initramfs -u -k "\$version"
+else
+    update-initramfs -c -k "\$version"
+fi
+
+DEB_MAINT_PARAMS=configure run-parts --verbose --exit-on-error \\
+    --arg="\$version" --arg="\$image" /etc/kernel/postinst.d
+EOF
+chmod 0755 "$package/DEBIAN/postinst"
+dpkg-deb --root-owner-group --build "$package" "$output/linux-image-${version}.deb"

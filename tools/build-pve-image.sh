@@ -4,13 +4,14 @@ set -euo pipefail
 root=$(realpath "$(dirname "$0")/..")
 platform=${PVE_PLATFORM:-pi4}
 rootfs_type=${PVE_ROOTFS:-ext4}
+kernel_deb=${PVE_KERNEL_DEB:-}
 output=""
 stage=all
 reset=0
 
 usage() {
     cat <<EOF
-usage: $0 [--platform pi4|pi5] [--rootfs ext4|zfs] [--output PATH] [--stage STAGE] [--reset]
+usage: $0 --kernel-deb PATH [--platform pi4|pi5] [--rootfs ext4|zfs] [--output PATH] [--stage STAGE] [--reset]
 
 Stages: bootstrap, proxmox, configure, assemble, all, clean
 EOF
@@ -20,6 +21,7 @@ while (($#)); do
     case "$1" in
         --platform) platform=${2:?missing value for --platform}; shift 2 ;;
         --rootfs) rootfs_type=${2:?missing value for --rootfs}; shift 2 ;;
+        --kernel-deb) kernel_deb=${2:?missing value for --kernel-deb}; shift 2 ;;
         --output) output=${2:?missing value for --output}; shift 2 ;;
         --stage) stage=${2:?missing value for --stage}; shift 2 ;;
         --reset) reset=1; shift ;;
@@ -31,16 +33,12 @@ done
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
 case "$platform" in
     pi4)
-        kernel_image_package=linux-image-rpi-v8
-        kernel_headers_package=linux-headers-rpi-v8
         kernel_modules_suffix=-rpi-v8
         boot_kernel=kernel8.img
         boot_initramfs=initramfs8
         boot_dtb=bcm2711-rpi-4-b.dtb
         ;;
     pi5)
-        kernel_image_package=linux-image-rpi-2712
-        kernel_headers_package=linux-headers-rpi-2712
         kernel_modules_suffix=-rpi-2712
         boot_kernel=kernel_2712.img
         boot_initramfs=initramfs_2712
@@ -54,7 +52,8 @@ case "$rootfs_type" in
 esac
 [[ -n $output ]] || output="$root/dist/proxmox-ve-$platform-$rootfs_type.img"
 [[ $(id -u) -eq 0 ]] || die "run as root"
-for command in curl debootstrap du gpg losetup mkfs.vfat mount parted partprobe rsync sha256sum umount; do
+[[ -f $kernel_deb ]] || die "--kernel-deb must name an existing package"
+for command in curl debootstrap dpkg-deb du gpg losetup mkfs.vfat mount parted partprobe rsync sha256sum umount; do
     command -v "$command" >/dev/null || die "missing command: $command"
 done
 if [[ $rootfs_type == ext4 ]]; then
@@ -64,6 +63,17 @@ else
         command -v "$command" >/dev/null || die "missing command: $command"
     done
 fi
+
+kernel_package=$(dpkg-deb -f "$kernel_deb" Package)
+kernel_package_version=$(dpkg-deb -f "$kernel_deb" Version)
+kernel_package_architecture=$(dpkg-deb -f "$kernel_deb" Architecture)
+kernel_package_sha256=$(sha256sum "$kernel_deb" | cut -d' ' -f1)
+[[ $kernel_package == linux-image-* ]] || die "kernel package must be named linux-image-*"
+[[ $kernel_package_architecture == arm64 ]] || die "kernel package must target arm64"
+case "$platform" in
+    pi4) [[ $kernel_package_version == *-rpi-v8 ]] || die "kernel package is not a Pi 4 rpi-v8 build" ;;
+    pi5) [[ $kernel_package_version == *-rpi-2712 ]] || die "kernel package is not a Pi 5 rpi-2712 build" ;;
+esac
 
 work=${WORKDIR:-"$root/.dev/$platform-$rootfs_type-image-build"}
 rootfs="$work/rootfs"
@@ -94,6 +104,7 @@ complete() { [[ -e "$state/$1" ]]; }
 configuration_digest() {
     printf '%s\0' \
         "$platform" "$rootfs_type" "$mirror" "$proxmox_key_url" "$raspi_key_url" "$raspi_repo" \
+        "$kernel_package" "$kernel_package_version" "$kernel_package_sha256" \
         "$root_password" "$hostname" "$domain" "$ipv4_cidr" "$gateway" "$dns_server" \
         "$root_min_gib" "$root_reserve_gib" "$root_align_mib" |
         sha256sum | cut -d' ' -f1
@@ -265,12 +276,14 @@ Signed-By: /etc/apt/keyrings/raspberrypi-archive-keyring.gpg
 EOF
     chroot_exec apt-get update -qq
     chroot_exec apt-get install -y -qq \
-        "$kernel_image_package" "$kernel_headers_package" raspi-firmware \
-        build-essential dkms zfs-dkms zfsutils-linux zfs-initramfs \
+        raspi-firmware \
         raspi-utils-core raspi-utils-dt rpi-eeprom raspinfo \
         locales kmod initramfs-tools openssh-server chrony cron postfix \
         console-setup keyboard-configuration ipvsadm iputils-ping nano dialog \
         parted bsdextrautils tar dosfstools e2fsprogs fdisk util-linux rsync
+    install -D -m 0644 "$kernel_deb" "$rootfs/tmp/$kernel_package.deb"
+    chroot_exec apt-get install -y -qq "/tmp/$kernel_package.deb"
+    rm -f "$rootfs/tmp/$kernel_package.deb"
     mark bootstrap
 }
 
@@ -289,7 +302,7 @@ Architectures: arm64 amd64
 Signed-By: /etc/apt/keyrings/proxmox-archive-keyring.gpg
 EOF
     cat > "$rootfs/etc/apt/preferences.d/no-proxmox-kernels" <<'EOF'
-Package: proxmox-ve proxmox-default-kernel proxmox-kernel-*
+Package: proxmox-ve proxmox-default-kernel proxmox-kernel-* linux-image-rpi-*-rt linux-image-*-rpi-*-rt linux-headers-rpi-*-rt linux-headers-*-rpi-*-rt
 Pin: version *
 Pin-Priority: -1
 EOF
@@ -408,8 +421,8 @@ EOF
     chroot_exec debconf-set-selections <<<'debconf debconf/frontend select Noninteractive'
     printf 'LANG=C.UTF-8\n' > "$rootfs/etc/default/locale"
     chroot_exec locale-gen C.UTF-8
-    chroot_exec dkms status
-    compgen -G "$rootfs/lib/modules/$release/updates/dkms/zfs.ko*" >/dev/null || die "ZFS DKMS module missing for $release"
+    [[ -s "$rootfs/lib/modules/$release/updates/zfs/spl.ko" ]] || die "built-in SPL module missing for $release"
+    [[ -s "$rootfs/lib/modules/$release/updates/zfs/zfs.ko" ]] || die "built-in ZFS module missing for $release"
     rm -f "$rootfs/etc/pve/local/"*.pem
     rm -f "$rootfs/usr/sbin/policy-rc.d"
     chroot_exec apt-get clean

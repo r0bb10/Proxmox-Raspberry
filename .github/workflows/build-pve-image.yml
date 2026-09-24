@@ -79,11 +79,56 @@ jobs:
           sudo apt-get install -y debootstrap dosfstools e2fsprogs parted rsync gnupg zfsutils-linux
           sudo modprobe zfs
 
+      - name: Download latest custom kernel for target platform
+        id: kernel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$PVE_PLATFORM" in
+            pi4) asset_pattern='^linux-image-.*-rpi-v8\.deb$' ;;
+            pi5) asset_pattern='^linux-image-.*-rpi-2712\.deb$' ;;
+            *) echo "FATAL: unsupported platform: $PVE_PLATFORM" >&2; exit 1 ;;
+          esac
+
+          match="$({
+            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+              jq -r --arg pattern "$asset_pattern" '
+                first(
+                  .[][] |
+                  select((.draft | not) and (.prerelease | not)) as $release |
+                  $release.assets[] |
+                  select(.name | test($pattern)) |
+                  [$release.tag_name, .name, .browser_download_url, (.digest // "")] |
+                  @tsv
+                ) // empty
+              '
+          })"
+          if [ -z "$match" ]; then
+            echo "FATAL: no published custom kernel is available for $PVE_PLATFORM" >&2
+            exit 1
+          fi
+
+          IFS=$'\t' read -r release_tag asset_name asset_url asset_digest <<<"$match"
+          if [[ ! $asset_digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "FATAL: release asset $asset_name has no valid SHA-256 digest" >&2
+            exit 1
+          fi
+
+          mkdir -p kernel
+          curl --fail --location --silent --show-error --output "kernel/$asset_name" "$asset_url"
+          printf '%s  %s\n' "${asset_digest#sha256:}" "kernel/$asset_name" | sha256sum --check --status
+
+          printf 'path=%s\n' "$GITHUB_WORKSPACE/kernel/$asset_name" >> "$GITHUB_OUTPUT"
+          printf 'release_tag=%s\n' "$release_tag" >> "$GITHUB_OUTPUT"
+          printf 'asset_name=%s\n' "$asset_name" >> "$GITHUB_OUTPUT"
+
       - name: Build Raspberry Pi image
         run: |
           sudo --preserve-env=PVE_ROOT_PASSWORD,PVE_PLATFORM,PVE_ROOTFS,PVE_HOSTNAME,PVE_DOMAIN,PVE_IPV4_CIDR,PVE_GATEWAY,PVE_DNS_SERVER bash tools/build-pve-image.sh \
             --platform "$PVE_PLATFORM" \
             --rootfs "$PVE_ROOTFS" \
+            --kernel-deb "${{ steps.kernel.outputs.path }}" \
             --output "dist/proxmox-ve-$PVE_PLATFORM-$PVE_ROOTFS.img" \
             --reset
 
