@@ -41,6 +41,17 @@ while IFS= read -r option; do
     "$source/scripts/config" --file "$build/.config" "${arguments[@]}"
 done < "$root/configs/proxmox.opts"
 make -C "$source" O="$build" ARCH=arm64 olddefconfig
+while read -r action symbol value; do
+    [[ -z $action || $action == \#* ]] && continue
+    case "$action" in
+        -e) expected="$symbol=y" ;;
+        -m) expected="$symbol=m" ;;
+        -d) expected="# $symbol is not set" ;;
+        --set-str) expected="$symbol=\"$value\"" ;;
+        *) die "unsupported kernel option action: $action" ;;
+    esac
+    grep -qxF "$expected" "$build/.config" || die "kernel configuration did not retain $expected"
+done < "$root/configs/proxmox.opts"
 # Raspberry Pi's defconfig owns the hardware suffix (for example, -v8).
 # A build-tree localversion file prefixes it without replacing that suffix.
 printf '%s\n' '-rpi' > "$build/localversion-pmx"
