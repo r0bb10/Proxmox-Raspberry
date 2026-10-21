@@ -121,7 +121,7 @@ jobs:
           name: rpi-kernel-${{ matrix.kernel_version }}
           path: .artifacts/packages/*.deb
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 1
 
   validate:
     needs: [resolve, build]
