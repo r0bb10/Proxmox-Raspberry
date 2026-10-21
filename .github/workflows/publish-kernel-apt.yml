@@ -1,0 +1,45 @@
+name: Publish Kernel APT
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: kernel-apt-pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install repository tools
+        run: sudo apt-get update && sudo apt-get install -y apt-utils dpkg-dev gnupg
+      - name: Generate signed repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          APT_SIGNING_FINGERPRINT: ${{ secrets.APT_SIGNING_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$(mktemp -d)"
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+          printf '%s' "$APT_SIGNING_KEY" | gpg --batch --import
+          python3 tools/publish-kernel-apt.py
+          gpg --export "$APT_SIGNING_FINGERPRINT" > "$GNUPGHOME/verify.gpg"
+          gpgv --keyring "$GNUPGHOME/verify.gpg" apt-site/InRelease
+          gpgv --keyring "$GNUPGHOME/verify.gpg" apt-site/dists/trixie/InRelease
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: apt-site
+      - name: Deploy repository
+        id: deployment
+        uses: actions/deploy-pages@v4

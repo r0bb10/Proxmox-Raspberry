@@ -1,0 +1,6 @@
+Types: deb
+URIs: https://r0bb10.github.io/Proxmox-Raspberry/
+Suites: trixie
+Components: main
+Architectures: arm64
+Signed-By: /etc/apt/keyrings/rpi-pve-kernel.asc

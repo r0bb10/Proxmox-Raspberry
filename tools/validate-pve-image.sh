@@ -29,12 +29,14 @@ dns_server=${PVE_DNS_SERVER:?PVE_DNS_SERVER is required}
 case "$platform" in
     pi4)
         stock_kernel_package=linux-image-rpi-v8
+        kernel_metapackage=rpi-pve-kernel-v8
         boot_kernel=kernel8.img
         boot_initramfs=initramfs8
         boot_dtb=bcm2711-rpi-4-b.dtb
         ;;
     pi5)
         stock_kernel_package=linux-image-rpi-2712
+        kernel_metapackage=rpi-pve-kernel-2712
         boot_kernel=kernel_2712.img
         boot_initramfs=initramfs_2712
         boot_dtb=bcm2712-rpi-5-b.dtb
@@ -123,6 +125,16 @@ grep -qFx "    gateway $gateway" "$root/etc/network/interfaces"
 grep -qFx "    dns-nameservers $dns_server" "$root/etc/network/interfaces"
 [[ -s $root/etc/modprobe.d/zfs.conf ]]
 chroot "$root" dpkg-query -W pve-edk2-firmware pve-edk2-firmware-aarch64 bluez-firmware firmware-brcm80211
+[[ -s $root/etc/apt/keyrings/rpi-pve-kernel.asc ]]
+[[ -x $root/etc/kernel/postinst.d/zz-rpi-pve-rollback ]]
+grep -qFx 'Architectures: arm64' "$root/etc/apt/sources.list.d/rpi-pve-kernel.sources"
+grep -qFx 'Suites: trixie' "$root/etc/apt/sources.list.d/rpi-pve-kernel.sources"
+grep -qFx 'Components: main' "$root/etc/apt/sources.list.d/rpi-pve-kernel.sources"
+grep -qFx 'Signed-By: /etc/apt/keyrings/rpi-pve-kernel.asc' "$root/etc/apt/sources.list.d/rpi-pve-kernel.sources"
+grep -qFx 'Architectures: arm64' "$root/etc/apt/sources.list.d/proxmox.sources"
+for package in "$kernel_metapackage" rpi-pve-kernel-support; do
+    [[ $(chroot "$root" dpkg-query -W -f='${Status}' "$package") == 'install ok installed' ]]
+done
 pve_firmware_version=$(chroot "$root" dpkg-query -W -f='${Version}' pve-firmware)
 [[ $pve_firmware_version == *+rpi1 ]]
 grep -qFx 'Package: pve-firmware' "$root/etc/apt/preferences.d/pve-firmware-rpi"

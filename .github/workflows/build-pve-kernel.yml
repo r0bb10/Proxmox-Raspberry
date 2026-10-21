@@ -268,3 +268,12 @@ jobs:
               --notes-file "$notes"
           fi
           gh release upload "$RELEASE_TAG" kernel/* --repo "$GITHUB_REPOSITORY" --clobber
+
+  apt:
+    needs: publish
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/publish-kernel-apt.yml
+    secrets: inherit

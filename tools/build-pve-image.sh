@@ -113,6 +113,7 @@ configuration_digest() {
     printf '%s\0' \
         "$platform" "$rootfs_type" "$mirror" "$proxmox_key_url" "$raspi_key_url" "$raspi_repo" \
         "$kernel_package" "$kernel_package_version" "$kernel_package_sha256" \
+        "$(sha256sum "$root/configs/rpi-pve-kernel.sources" "$root/configs/rpi-pve-kernel.asc")" \
         "$root_password" "$hostname" "$domain" "$ipv4_cidr" "$gateway" "$dns_server" \
         "$root_min_gib" "$root_reserve_gib" "$root_align_mib" |
         sha256sum | cut -d' ' -f1
@@ -313,8 +314,16 @@ EOF
         locales kmod initramfs-tools openssh-server chrony cron postfix \
         console-setup keyboard-configuration ipvsadm iputils-ping nano dialog \
         parted bsdextrautils tar dosfstools e2fsprogs fdisk util-linux rsync
+    install -m 0644 "$root/configs/rpi-pve-kernel.asc" "$rootfs/etc/apt/keyrings/rpi-pve-kernel.asc"
+    install -m 0644 "$root/configs/rpi-pve-kernel.sources" "$rootfs/etc/apt/sources.list.d/rpi-pve-kernel.sources"
+    chroot_exec apt-get update -qq
+    # Install the fallback hook before configuring the first custom kernel.
+    chroot_exec apt-get install --no-remove -y -qq rpi-pve-kernel-support
     install -D -m 0644 "$kernel_deb" "$rootfs/tmp/$kernel_package.deb"
     chroot_exec apt-get install -y -qq "/tmp/$kernel_package.deb"
+    # Track updates, but keep this image on its explicitly selected release.
+    chroot_exec apt-get install --no-remove -y -qq \
+        "rpi-pve-kernel-${kernel_modules_suffix##*-}=$kernel_package_version"
     rm -f "$rootfs/tmp/$kernel_package.deb"
     mark bootstrap
 }
@@ -330,7 +339,7 @@ Types: deb
 URIs: http://download.proxmox.com/debian/pve
 Suites: trixie
 Components: pve-no-subscription
-Architectures: arm64 amd64
+Architectures: arm64
 Signed-By: /etc/apt/keyrings/proxmox-archive-keyring.gpg
 EOF
     cat > "$rootfs/etc/apt/preferences.d/no-proxmox-kernels" <<'EOF'
