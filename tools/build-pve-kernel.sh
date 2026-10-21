@@ -19,7 +19,11 @@ die() { printf 'error: %s\n' "$1" >&2; exit 1; }
 
 [[ $(dpkg --print-architecture) == arm64 ]] || die "native arm64 build required"
 [[ $rpi_head =~ ^[0-9a-f]{40}$ ]] || die "invalid RPI_HEAD"
-[[ $rpi_flavour == v8 ]] || die "Pi 4 builds require RPI_FLAVOUR=v8"
+case "$rpi_flavour" in
+    v8) defconfig=bcm2711_defconfig; boot_dtb=bcm2711-rpi-4-b.dtb; platform='Pi 4' ;;
+    2712) defconfig=bcm2712_defconfig; boot_dtb=bcm2712-rpi-5-b.dtb; platform='Pi 5' ;;
+    *) die "RPI_FLAVOUR must be v8 or 2712" ;;
+esac
 [[ -f $root/configs/proxmox.opts ]] || die "missing configs/proxmox.opts"
 [[ -f $root/patches/kernel.patch ]] || die "missing PMX metadata patch"
 
@@ -34,13 +38,18 @@ git -C "$source" checkout --quiet --detach FETCH_HEAD
 git -C "$source" apply --check "$root/patches/kernel.patch"
 git -C "$source" apply "$root/patches/kernel.patch"
 
-make -C "$source" O="$build" ARCH=arm64 bcm2711_defconfig
+make -C "$source" O="$build" ARCH=arm64 "$defconfig"
+# Upstream's Pi 5 defconfig uses -v8-16k; raspi-firmware selects Pi 5 boot
+# files using -2712. Keep its stock 16K page size, changing only the suffix.
+"$source/scripts/config" --file "$build/.config" --set-str CONFIG_LOCALVERSION "-$rpi_flavour"
 while IFS= read -r option; do
     [[ -z $option || $option == \#* ]] && continue
     read -r -a arguments <<< "$option"
     "$source/scripts/config" --file "$build/.config" "${arguments[@]}"
 done < "$root/configs/proxmox.opts"
 make -C "$source" O="$build" ARCH=arm64 olddefconfig
+# kernelrelease reads include/config/auto.conf, not .config directly.
+make -C "$source" O="$build" ARCH=arm64 syncconfig
 while read -r action symbol value; do
     [[ -z $action || $action == \#* ]] && continue
     case "$action" in
@@ -52,7 +61,7 @@ while read -r action symbol value; do
     esac
     grep -qxF "$expected" "$build/.config" || die "kernel configuration did not retain $expected"
 done < "$root/configs/proxmox.opts"
-# Raspberry Pi's defconfig owns the hardware suffix (for example, -v8).
+# The hardware flavour owns the suffix (-v8 or -2712).
 # A build-tree localversion file prefixes it without replacing that suffix.
 printf '%s\n' '-rpi' > "$build/localversion-pmx"
 
@@ -82,7 +91,7 @@ overlay_readme="$source/arch/arm64/boot/dts/overlays/README"
 
 for required in \
     "$build/arch/arm64/boot/Image" \
-    "$dtbs/broadcom/bcm2711-rpi-4-b.dtb" \
+    "$dtbs/broadcom/$boot_dtb" \
     "$overlay_readme" \
     "$zfs/module/spl.ko" \
     "$zfs/module/zfs.ko"; do
@@ -110,7 +119,7 @@ Architecture: arm64
 Maintainer: Proxmox Raspberry Build <root@localhost>
 Depends: initramfs-tools, kmod, zfs-initramfs, zfsutils-linux (>= $zfs_version), zfsutils-linux (<< ${zfs_version%.*}.$((${zfs_version##*.} + 1)))
 Provides: zfs-modules
-Description: Raspberry Pi 4 Proxmox kernel and OpenZFS modules $version
+Description: Raspberry $platform Proxmox kernel and OpenZFS modules $version
  Custom Raspberry Pi kernel with Proxmox host features and matched OpenZFS modules.
 EOF
 

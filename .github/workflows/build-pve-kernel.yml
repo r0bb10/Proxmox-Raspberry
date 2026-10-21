@@ -6,9 +6,21 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: Rebuild and replace existing release assets
+        description: Rebuild selected flavours (published packages are never replaced)
         type: boolean
         default: false
+      source_ref:
+        description: Raspberry Pi source ref or commit (blank uses the tracked branch)
+        type: string
+        default: ''
+      flavour:
+        description: Kernel flavours to check for missing release assets
+        type: choice
+        options:
+          - all
+          - v8
+          - '2712'
+        default: all
 
 permissions:
   actions: read
@@ -18,7 +30,7 @@ env:
   RPI_BRANCH: rpi-6.18.y
 
 concurrency:
-  group: rpi-pi4-kernel
+  group: rpi-kernel
   cancel-in-progress: false
 
 jobs:
@@ -27,22 +39,31 @@ jobs:
     timeout-minutes: 15
     outputs:
       build: ${{ steps.detect.outputs.build }}
-      force: ${{ steps.detect.outputs.force }}
       rpi_head: ${{ steps.detect.outputs.rpi_head }}
-      kernel_version: ${{ steps.detect.outputs.kernel_version }}
+      matrix: ${{ steps.detect.outputs.matrix }}
       release_tag: ${{ steps.detect.outputs.release_tag }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Test release planning and immutable publication
+        run: python3 -B -m unittest discover -s tools -p 'test_kernel_release.py' -v
+
       - name: Resolve Raspberry Pi kernel source release
         id: detect
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE_INPUT: ${{ inputs.force }}
+          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
+          FLAVOUR_INPUT: ${{ inputs.flavour }}
         run: |
           set -euo pipefail
           source="${RUNNER_TEMP}/rpi-linux"
+          source_ref="${SOURCE_REF_INPUT:-$RPI_BRANCH}"
+          [[ "$source_ref" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/-]*$ ]] || { echo 'Invalid source ref' >&2; exit 1; }
           git init --quiet "$source"
           git -C "$source" remote add origin https://github.com/raspberrypi/linux.git
-          git -C "$source" fetch --quiet --depth 1 origin "$RPI_BRANCH"
+          git -C "$source" fetch --quiet --depth 1 origin "$source_ref"
           git -C "$source" checkout --quiet --detach FETCH_HEAD
 
           rpi_head="$(git -C "$source" rev-parse HEAD)"
@@ -52,26 +73,19 @@ jobs:
           sublevel="$(sed -n 's/^SUBLEVEL = //p' "$makefile")"
           extraversion="$(sed -n 's/^EXTRAVERSION = //p' "$makefile")"
           [ -n "$version" ] && [ -n "$patchlevel" ] && [ -n "$sublevel" ]
-          kernel_version="${version}.${patchlevel}.${sublevel}${extraversion}-rpi-v8"
           release_tag="${version}.${patchlevel}.${sublevel}${extraversion}-rpi"
 
-          printf 'rpi_head=%s\nkernel_version=%s\nrelease_tag=%s\n' "$rpi_head" "$kernel_version" "$release_tag" >> "$GITHUB_OUTPUT"
-          force=0
-          [ "$FORCE_INPUT" != true ] || force=1
-          printf 'force=%s\n' "$force" >> "$GITHUB_OUTPUT"
-
-          if [ "$force" = 0 ] && gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::notice:: ${release_tag} is already published; nothing to do."
-            echo 'build=false' >> "$GITHUB_OUTPUT"
-          else
-            echo 'build=true' >> "$GITHUB_OUTPUT"
-          fi
+          printf 'rpi_head=%s\nrelease_tag=%s\n' "$rpi_head" "$release_tag" >> "$GITHUB_OUTPUT"
+          RELEASE_TAG="$release_tag" python3 tools/kernel-release.py plan
 
   build:
     needs: resolve
     if: needs.resolve.outputs.build == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -79,7 +93,7 @@ jobs:
       - name: Build native ARM64 Raspberry Pi package
         env:
           RPI_HEAD: ${{ needs.resolve.outputs.rpi_head }}
-          RPI_FLAVOUR: v8
+          RPI_FLAVOUR: ${{ matrix.flavour }}
           ZFS_VERSION: 2.4.4
           KBUILD_BUILD_VERSION: 1
         run: |
@@ -104,7 +118,7 @@ jobs:
       - name: Upload kernel package
         uses: actions/upload-artifact@v7
         with:
-          name: rpi-kernel-${{ needs.resolve.outputs.kernel_version }}
+          name: rpi-kernel-${{ matrix.kernel_version }}
           path: .artifacts/packages/*.deb
           if-no-files-found: error
           retention-days: 14
@@ -114,18 +128,27 @@ jobs:
     if: needs.resolve.outputs.build == 'true' && needs.build.result == 'success'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
     steps:
       - name: Download kernel package
         uses: actions/download-artifact@v8
         with:
-          name: rpi-kernel-${{ needs.resolve.outputs.kernel_version }}
+          name: rpi-kernel-${{ matrix.kernel_version }}
           path: kernel
 
       - name: Validate Raspberry Pi kernel payload
         env:
-          KERNEL_VERSION: ${{ needs.resolve.outputs.kernel_version }}
+          KERNEL_VERSION: ${{ matrix.kernel_version }}
+          RPI_FLAVOUR: ${{ matrix.flavour }}
         run: |
           set -euo pipefail
+          case "$RPI_FLAVOUR" in
+            v8) boot_dtb=bcm2711-rpi-4-b.dtb ;;
+            2712) boot_dtb=bcm2712-rpi-5-b.dtb ;;
+            *) exit 1 ;;
+          esac
           shopt -s nullglob
           packages=(kernel/linux-image-"$KERNEL_VERSION".deb)
           if [ "${#packages[@]}" -ne 1 ]; then
@@ -139,7 +162,10 @@ jobs:
           dpkg-deb --contents "${packages[0]}" > "$contents"
           dpkg-deb --extract "${packages[0]}" "$package_root"
           dpkg-deb --control "${packages[0]}" "$control_root"
-          grep -qE " \./usr/lib/linux-image-$KERNEL_VERSION/broadcom/bcm2711-rpi-4-b\.dtb$" "$contents"
+          test -s "$package_root/usr/lib/linux-image-$KERNEL_VERSION/broadcom/$boot_dtb"
+          [[ $(dpkg-deb -f "${packages[0]}" Package) == "linux-image-$KERNEL_VERSION" ]]
+          [[ $(dpkg-deb -f "${packages[0]}" Version) == "$KERNEL_VERSION" ]]
+          [[ $(dpkg-deb -f "${packages[0]}" Architecture) == arm64 ]]
           grep -qE " \./lib/modules/$KERNEL_VERSION/updates/zfs/spl\.ko$" "$contents"
           grep -qE " \./lib/modules/$KERNEL_VERSION/updates/zfs/zfs\.ko$" "$contents"
 
@@ -153,7 +179,8 @@ jobs:
           grep -qx 'Provides: zfs-modules' "$control_root/control"
           grep -Fq 'DEB_MAINT_PARAMS=configure run-parts' "$postinst"
           gzip -t "$image"
-          gzip -cd "$image" | strings | grep -Fq "#1 SMP PREEMPT_DYNAMIC PMX ${KERNEL_VERSION%-rpi-*} ("
+          gzip -cd "$image" > "$package_root/Image"
+          strings "$package_root/Image" | grep -F "#1 SMP PREEMPT_DYNAMIC PMX ${KERNEL_VERSION%-rpi-*} (" >/dev/null
           [[ $(modinfo -F vermagic "$spl_module") == "$KERNEL_VERSION"* ]]
           [[ $(modinfo -F vermagic "$zfs_module") == "$KERNEL_VERSION"* ]]
 
@@ -218,9 +245,16 @@ jobs:
             CONFIG_DM_UEVENT=y \
             CONFIG_SQUASHFS_LZ4=y \
             CONFIG_CEPH_LIB_USE_DNS_RESOLVER=y \
-            CONFIG_LOCALVERSION=\"-v8\"; do
+            CONFIG_LOCALVERSION=\"-$RPI_FLAVOUR\"; do
             grep -qx "$option" "$config"
           done
+          if [ "$RPI_FLAVOUR" = 2712 ]; then
+            for option in CONFIG_ARM64_16K_PAGES=y CONFIG_MFD_RP1=y CONFIG_PINCTRL_RP1=y CONFIG_MACB=y CONFIG_BLK_DEV_NVME=y; do
+              grep -qx "$option" "$config"
+            done
+          else
+            grep -qx CONFIG_ARM64_4K_PAGES=y "$config"
+          fi
 
   publish:
     needs: [resolve, build, validate]
@@ -231,43 +265,24 @@ jobs:
       group: pve-rpi-release-${{ needs.resolve.outputs.release_tag }}
       cancel-in-progress: false
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
       - name: Download kernel package
         uses: actions/download-artifact@v8
         with:
-          name: rpi-kernel-${{ needs.resolve.outputs.kernel_version }}
+          pattern: rpi-kernel-*
+          merge-multiple: true
           path: kernel
 
       - name: Publish validated kernel package
         env:
           GH_TOKEN: ${{ github.token }}
-          KERNEL_VERSION: ${{ needs.resolve.outputs.kernel_version }}
           RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          BUILD_MATRIX: ${{ needs.resolve.outputs.matrix }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          packages=(kernel/linux-image-"$KERNEL_VERSION".deb)
-          if [ "${#packages[@]}" -ne 1 ]; then
-            echo "FATAL: expected one ARM64 kernel package" >&2
-            exit 1
-          fi
-
-          notes="${RUNNER_TEMP}/kernel-release-notes.md"
-          cat > "$notes" <<EOF
-          Custom ARM64 Proxmox VE kernel for Raspberry Pi.
-
-          - Platforms: Raspberry Pi 4 and Raspberry Pi 5
-          - Base: official Raspberry Pi Linux \`$RPI_BRANCH\` branch
-          - Install with: \`apt install ./linux-image-${RELEASE_TAG}-*.deb\`
-          EOF
-
-          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" \
-              --title "$RELEASE_TAG" \
-              --notes-file "$notes"
-          fi
-          gh release upload "$RELEASE_TAG" kernel/* --repo "$GITHUB_REPOSITORY" --clobber
+          python3 tools/kernel-release.py publish
 
   apt:
     needs: publish

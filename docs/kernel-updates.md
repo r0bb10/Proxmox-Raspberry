@@ -26,7 +26,7 @@ apt-get --no-remove install rpi-pve-kernel-support
 apt-get --no-remove install rpi-pve-kernel-v8
 ```
 
-Use `rpi-pve-kernel-2712` for Pi 5 once a matching kernel release is published.
+Use `rpi-pve-kernel-2712` for Pi 5.
 Future images include the key, deb822 source, helper and matching metapackage.
 Their Proxmox source is ARM64-only to avoid mixing incompatible versions of
 architecture-independent packages from the AMD64 index.
@@ -57,6 +57,17 @@ Choose its matching boot payload explicitly instead of assuming a package
 downgrade changes the boot target.
 
 ## Publishing
+
+The kernel workflow builds a matrix of missing `v8` (Pi 4) and `2712` (Pi 5)
+assets from one resolved Raspberry Pi source commit. Both apply `proxmox.opts`
+to their stock defconfig. Pi 5 retains its stock 16K pages, with the suffix
+normalized to `-2712` for the firmware hooks. All selected builds must validate
+before publication. Existing release assets are never overwritten.
+
+Manual dispatch accepts `source_ref` (upstream branch/tag/commit) and `flavour`
+(`all`, `v8`, or `2712`). This allows filling a missing flavour in an existing
+release without rebuilding its other asset. `force` rebuilds selected assets
+but still refuses to replace different published bytes.
 
 Pages uses the GitHub Actions source. The repository's Actions secrets contain
 `APT_SIGNING_KEY` (ASCII-armored private signing key) and
