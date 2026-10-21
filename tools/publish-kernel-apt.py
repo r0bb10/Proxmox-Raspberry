@@ -10,6 +10,8 @@ import subprocess
 import urllib.error
 import urllib.request
 
+from kernel_apt_retention import MAX_SITE_BYTES, select_kernels
+
 
 def run(*args, **kwargs):
     return subprocess.check_output(args, **kwargs).decode().strip()
@@ -19,6 +21,8 @@ root = Path(__file__).resolve().parent.parent
 # Make regenerated metapackages byte-identical for an unchanged version.
 os.environ['SOURCE_DATE_EPOCH'] = '0'
 out = Path(os.environ.get('APT_OUTPUT', 'apt-site')).resolve()
+if out.exists() and any(out.iterdir()):
+    raise SystemExit('APT_OUTPUT must be empty to avoid publishing stale packages')
 out.mkdir(parents=True, exist_ok=True)
 (out / 'pool').mkdir(exist_ok=True)
 repo = os.environ['GITHUB_REPOSITORY']
@@ -41,7 +45,7 @@ for index in ['dists/trixie/main/binary-arm64/Packages', 'Packages']:
 releases = [[json.loads(line) for line in run(
     'gh', 'api', f'repos/{repo}/releases?per_page=100',
     '--paginate', '--jq', '.[] | @json').splitlines()]]
-count = 0
+kernels = []
 for page in releases:
     for release in page:
         if release['draft'] or release['prerelease']:
@@ -51,22 +55,36 @@ for page in releases:
             if not match:
                 continue
             kernel, flavour = match.groups()
-            dest = out / 'pool' / asset['name']
-            subprocess.run(['gh', 'release', 'download', release['tag_name'],
-                            '--repo', repo, '--pattern', asset['name'],
-                            '--dir', str(out / 'pool'), '--clobber'], check=True)
-            digest = hashlib.sha256(dest.read_bytes()).hexdigest()
-            filename = 'pool/' + dest.name
-            if filename in known and known[filename] != digest:
-                raise SystemExit(f'Replaced immutable package: {filename}')
-            package = run('dpkg-deb', '-f', str(dest), 'Package')
-            version = run('dpkg-deb', '-f', str(dest), 'Version')
-            arch = run('dpkg-deb', '-f', str(dest), 'Architecture')
-            if package != 'linux-image-' + kernel or arch != 'arm64':
-                raise SystemExit(f'Unexpected package identity: {dest}')
-            stage = out / 'stage' / f'{flavour}-{version}' / 'DEBIAN'
-            stage.mkdir(parents=True, exist_ok=True)
-            (stage / 'control').write_text(f'''Package: rpi-pve-kernel-{flavour}
+            kernels.append({'kernel': kernel, 'flavour': flavour,
+                            'name': asset['name'], 'size': asset['size'],
+                            'tag': release['tag_name']})
+selected, pruned = select_kernels(kernels)
+prunable = set()
+for item in pruned:
+    prunable.update([
+        'pool/' + item['name'],
+        f"pool/rpi-pve-kernel-{item['flavour']}_{item['kernel']}_arm64.deb",
+    ])
+    print(f"Pruned from Pages only: {item['name']} (still available in Releases)")
+count = 0
+for item in selected:
+    kernel, flavour = item['kernel'], item['flavour']
+    dest = out / 'pool' / item['name']
+    subprocess.run(['gh', 'release', 'download', item['tag'],
+                    '--repo', repo, '--pattern', item['name'],
+                    '--dir', str(out / 'pool'), '--clobber'], check=True)
+    digest = hashlib.sha256(dest.read_bytes()).hexdigest()
+    filename = 'pool/' + dest.name
+    if filename in known and known[filename] != digest:
+        raise SystemExit(f'Replaced immutable package: {filename}')
+    package = run('dpkg-deb', '-f', str(dest), 'Package')
+    version = run('dpkg-deb', '-f', str(dest), 'Version')
+    arch = run('dpkg-deb', '-f', str(dest), 'Architecture')
+    if package != 'linux-image-' + kernel or arch != 'arm64':
+        raise SystemExit(f'Unexpected package identity: {dest}')
+    stage = out / 'stage' / f'{flavour}-{version}' / 'DEBIAN'
+    stage.mkdir(parents=True, exist_ok=True)
+    (stage / 'control').write_text(f'''Package: rpi-pve-kernel-{flavour}
 Version: {version}
 Architecture: arm64
 Maintainer: Proxmox Raspberry Build <root@localhost>
@@ -75,9 +93,9 @@ Priority: optional
 Depends: {package} (= {version}), rpi-pve-kernel-support (>= 1.0)
 Description: Track the custom Raspberry Pi {flavour} Proxmox kernel
 ''')
-            subprocess.run(['dpkg-deb', '--root-owner-group', '--build', str(stage.parent),
-                            str(out / 'pool' / f'rpi-pve-kernel-{flavour}_{version}_arm64.deb')], check=True)
-            count += 1
+    subprocess.run(['dpkg-deb', '--root-owner-group', '--build', str(stage.parent),
+                    str(out / 'pool' / f'rpi-pve-kernel-{flavour}_{version}_arm64.deb')], check=True)
+    count += 1
 if not count:
     raise SystemExit('No release kernels found')
 
@@ -102,6 +120,8 @@ packages = run('dpkg-scanpackages', '--multiversion', 'pool', cwd=out) + '\n'
 for filename, digest in known.items():
     package_file = out / filename
     if not package_file.is_file():
+        if filename in prunable:
+            continue
         raise SystemExit(f'Refusing to drop published package: {filename}')
     if hashlib.sha256(package_file.read_bytes()).hexdigest() != digest:
         raise SystemExit(f'Replaced immutable package: {filename}; bump its version')
@@ -138,4 +158,8 @@ sign_release(suite, {'Suite': 'trixie', 'Codename': 'trixie',
                      'Components': 'main', 'Architectures': 'arm64'})
 # Keep existing flat-source clients working during migration.
 sign_release(out, {'Architectures': 'arm64 all'})
+site_bytes = sum(path.stat().st_size for path in out.rglob('*') if path.is_file())
+if site_bytes > MAX_SITE_BYTES:
+    raise SystemExit(f'Pages site exceeds {MAX_SITE_BYTES} bytes: {site_bytes}; not deploying')
+print(f'Pages size: {site_bytes:,} / {MAX_SITE_BYTES:,} bytes; {len(pruned)} kernels pruned.')
 print(f'Published metadata for {count} kernels; release assets untouched.')

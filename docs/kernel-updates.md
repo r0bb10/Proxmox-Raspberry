@@ -3,8 +3,8 @@
 GitHub Releases remain kernel-only downloads. A separate signed `trixie/main` APT
 repository is deployed to <https://r0bb10.github.io/Proxmox-Raspberry/> by
 `.github/workflows/publish-kernel-apt.yml`. The kernel build calls it after a
-successful release; it can also be run manually. All published release kernels
-are retained, with flavour-specific metapackages. No automatic reboot is enabled.
+successful release; it can also be run manually. Released kernels are indexed
+with flavour-specific metapackages. No automatic reboot is enabled.
 The previous flat (`Suites: ./`) layout remains available for existing clients;
 new installations use `Suites: trixie` and `Components: main`.
 
@@ -51,7 +51,8 @@ failure detector. Save your current config before selecting the fallback.
 Restore the normal config to return to the current kernel. Do not delete the
 fallback kernel package while its boot configuration is in use.
 
-Older packages can also be downloaded or installed from APT; merely installing
+Older packages can also be downloaded from Releases or installed from APT while
+retained there; merely installing
 an older kernel does not override raspi-firmware's selection of the newest one.
 Choose its matching boot payload explicitly instead of assuming a package
 downgrade changes the boot target.
@@ -74,9 +75,23 @@ Pages uses the GitHub Actions source. The repository's Actions secrets contain
 `APT_SIGNING_FINGERPRINT`. The public key is tracked under `configs/`.
 Keep the private key out of source control and logs.
 
-Metapackages are rebuilt reproducibly. The publisher rejects replaced or missing
-previously published package files. Never replace an existing kernel `.deb`:
+Metapackages are rebuilt reproducibly. The publisher rejects replaced package
+files and unexplained missing packages. Never replace an existing kernel `.deb`:
 use a new package version for rebuilds. Likewise, changes to the fallback helper
 require bumping its package version in `tools/publish-kernel-apt.py`. Removing
 older GitHub Releases will intentionally fail publication rather than silently
 drop rollback packages.
+
+### Pages size and retention
+
+The deployment is capped at 900 MB (decimal), below GitHub's 1 GB limit. The
+publisher reserves 8 MB for metadata/support files and removes the oldest
+kernels and matching metapackages when necessary. It protects the newest two
+available versions per flavour (or all versions if fewer exist). Selection is
+based on Debian version ordering, not release upload timestamps; only selected
+kernels are downloaded into the deployment.
+
+GitHub Release assets and kernels installed on nodes are never removed by this
+policy. Pruned kernels remain available for manual download from Releases. If
+the protected set cannot fit, publication fails and the live repository stays
+untouched. An actual final-size check also blocks any oversized deployment.
